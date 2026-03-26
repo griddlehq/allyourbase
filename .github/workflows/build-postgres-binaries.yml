@@ -65,7 +65,7 @@ jobs:
       - name: Install build dependencies (macOS)
         if: runner.os == 'macOS'
         run: |
-          brew install openssl libxml2 ossp-uuid readline xz
+          brew install openssl libxml2 readline xz
 
       - name: Build Postgres binaries
         run: |

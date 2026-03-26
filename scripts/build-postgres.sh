@@ -53,12 +53,13 @@ UUID_PROVIDER="e2fs"
 if [ "${TARGET_OS}" = "darwin" ]; then
   OPENSSL_PREFIX="$(brew --prefix openssl@3 2>/dev/null || brew --prefix openssl)"
   LIBXML2_PREFIX="$(brew --prefix libxml2)"
-  UUID_PREFIX="$(brew --prefix ossp-uuid)"
-  export PKG_CONFIG_PATH="${OPENSSL_PREFIX}/lib/pkgconfig:${LIBXML2_PREFIX}/lib/pkgconfig:${UUID_PREFIX}/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
-  export CPPFLAGS="-I${OPENSSL_PREFIX}/include -I${LIBXML2_PREFIX}/include/libxml2 -I${UUID_PREFIX}/include ${CPPFLAGS:-}"
-  export LDFLAGS="-L${OPENSSL_PREFIX}/lib -L${LIBXML2_PREFIX}/lib -L${UUID_PREFIX}/lib ${LDFLAGS:-}"
+  # macOS ships uuid/uuid.h with the e2fs-style uuid_generate API, so we do
+  # not need Homebrew ossp-uuid here. Keeping this on the native SDK path avoids
+  # brittle header/layout differences between Homebrew bottles and GitHub runners.
+  export PKG_CONFIG_PATH="${OPENSSL_PREFIX}/lib/pkgconfig:${LIBXML2_PREFIX}/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+  export CPPFLAGS="-I${OPENSSL_PREFIX}/include -I${LIBXML2_PREFIX}/include/libxml2 ${CPPFLAGS:-}"
+  export LDFLAGS="-L${OPENSSL_PREFIX}/lib -L${LIBXML2_PREFIX}/lib ${LDFLAGS:-}"
   export LIBS="-lssl -lcrypto ${LIBS:-}"
-  UUID_PROVIDER="ossp"
 fi
 
 echo "Building ayb-postgres ${PG_VERSION} for ${PLATFORM}"
