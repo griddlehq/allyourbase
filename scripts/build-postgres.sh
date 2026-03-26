@@ -41,6 +41,9 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+mkdir -p "${OUTPUT_DIR}"
+OUTPUT_DIR="$(cd "${OUTPUT_DIR}" && pwd -P)"
+
 PLATFORM="${TARGET_OS}-${TARGET_ARCH}"
 ARCHIVE_NAME="ayb-postgres-${PG_VERSION}-${PLATFORM}.tar.xz"
 INSTALL_DIR="${OUTPUT_DIR}/ayb-postgres-${PG_VERSION}"
