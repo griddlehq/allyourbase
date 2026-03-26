@@ -48,6 +48,18 @@ PLATFORM="${TARGET_OS}-${TARGET_ARCH}"
 ARCHIVE_NAME="ayb-postgres-${PG_VERSION}-${PLATFORM}.tar.xz"
 INSTALL_DIR="${OUTPUT_DIR}/ayb-postgres-${PG_VERSION}"
 BUILD_DIR="${OUTPUT_DIR}/build"
+UUID_PROVIDER="e2fs"
+
+if [ "${TARGET_OS}" = "darwin" ]; then
+  OPENSSL_PREFIX="$(brew --prefix openssl@3 2>/dev/null || brew --prefix openssl)"
+  LIBXML2_PREFIX="$(brew --prefix libxml2)"
+  UUID_PREFIX="$(brew --prefix ossp-uuid)"
+  export PKG_CONFIG_PATH="${OPENSSL_PREFIX}/lib/pkgconfig:${LIBXML2_PREFIX}/lib/pkgconfig:${UUID_PREFIX}/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+  export CPPFLAGS="-I${OPENSSL_PREFIX}/include -I${LIBXML2_PREFIX}/include/libxml2 -I${UUID_PREFIX}/include ${CPPFLAGS:-}"
+  export LDFLAGS="-L${OPENSSL_PREFIX}/lib -L${LIBXML2_PREFIX}/lib -L${UUID_PREFIX}/lib ${LDFLAGS:-}"
+  export LIBS="-lssl -lcrypto ${LIBS:-}"
+  UUID_PROVIDER="ossp"
+fi
 
 echo "Building ayb-postgres ${PG_VERSION} for ${PLATFORM}"
 echo "Output: ${OUTPUT_DIR}/${ARCHIVE_NAME}"
@@ -81,7 +93,7 @@ if [ ! -f "${PG_BUILD}/src/backend/postgres" ]; then
     --prefix="${INSTALL_DIR}" \
     --with-openssl \
     --with-libxml \
-    --with-uuid=e2fs \
+    --with-uuid="${UUID_PROVIDER}" \
     --without-readline \
     --without-zlib \
     --without-icu \
