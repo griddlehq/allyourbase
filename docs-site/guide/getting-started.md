@@ -27,21 +27,21 @@ curl -fsSLo /tmp/ayb-install.sh https://install.allyourbase.io/install.sh
 sh /tmp/ayb-install.sh
 ```
 
-### Homebrew
-
-```bash
-brew install gridlhq/tap/ayb
-```
-
 ### Binary download
 
 Download the latest release from [GitHub Releases](https://github.com/gridlhq/allyourbase/releases) for your OS and architecture.
 
-### Docker
+### From source
 
 ```bash
-docker run --rm -p 8090:8090 ghcr.io/gridlhq/allyourbase
+git clone https://github.com/gridlhq/allyourbase.git
+cd allyourbase
+make build
 ```
+
+### Docker
+
+Public container-image pulls are not available right now because the current GitHub Container Registry package is still private. If you need a container immediately, follow the [Deployment](/guide/deployment) guide to build the image locally from the public repo checkout.
 
 ## Start the server
 
@@ -55,7 +55,7 @@ ayb start
 
 The first run may take longer because AYB downloads and prepares a managed PostgreSQL binary.
 
-Managed PostgreSQL is the zero-config path. If you need extension-backed features such as `pgvector`, `pg_cron`, or PostGIS, use an external PostgreSQL instance unless your managed PostgreSQL build explicitly includes those extensions.
+Managed PostgreSQL is the zero-config path. If you need extensions beyond the managed build's default set, such as PostGIS, use an external PostgreSQL instance unless your managed PostgreSQL build explicitly includes them.
 
 If `admin.password` is not set, startup generates a random admin password and prints:
 

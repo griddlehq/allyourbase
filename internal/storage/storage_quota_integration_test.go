@@ -5,6 +5,7 @@ package storage_test
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -396,53 +397,54 @@ func TestStorageResumableFinalizeIncrementsUsage(t *testing.T) {
 	testutil.Equal(t, int64(len(data)), info.BytesUsed)
 }
 
-func TestStorageQuotaConcurrentUploads(t *testing.T) {
-	ts, storageSvc, authSvc, tenantID := setupServerWithQuota(t, 500)
+func TestStorageQuotaConcurrentReservations(t *testing.T) {
+	ts, storageSvc, _, _ := setupServerWithQuota(t, 500)
 	defer ts.Close()
 	clearQuotaData(t)
 
 	userID := "22222222-2222-2222-2222-222222222222"
-	token := userToken(t, authSvc, userID, "race@example.com")
 	ensureStorageTestUser(t, userID, "race@example.com")
-	addStorageTestMembership(t, tenantID, userID)
-	bucket := fmt.Sprintf("race-%d", time.Now().UnixNano())
-	_, err := storageSvc.CreateBucket(context.Background(), bucket, false)
-	testutil.NoError(t, err)
 
-	const numUploads = 10
-	results := make(chan int, numUploads)
-	data := strings.Repeat("r", 100)
+	const (
+		numReservations = 10
+		reservationSize = int64(100)
+	)
+	results := make(chan error, numReservations)
 
-	for i := 0; i < numUploads; i++ {
-		go func(idx int) {
-			name := fmt.Sprintf("race-%d.txt", idx)
-			results <- uploadStatus(t, ts.URL, bucket, name, data, requestHeaders{token: token, tenantID: tenantID})
-		}(i)
+	for i := 0; i < numReservations; i++ {
+		go func() {
+			results <- storageSvc.ReserveQuota(context.Background(), userID, reservationSize)
+		}()
 	}
 
-	var successes, other int
-	for i := 0; i < numUploads; i++ {
-		status := <-results
-		switch status {
-		case http.StatusCreated:
+	var successes, quotaExceeded, other int
+	for i := 0; i < numReservations; i++ {
+		err := <-results
+		switch {
+		case err == nil:
 			successes++
-		case http.StatusRequestEntityTooLarge:
-		default:
+		case errors.Is(err, storage.ErrQuotaExceeded):
+			quotaExceeded++
+		case err != nil:
 			other++
 		}
 	}
 
-	testutil.True(t, successes >= 1, fmt.Sprintf("expected at least 1 success, got %d", successes))
+	// ReserveQuota is the atomic boundary that concurrent uploads rely on. Handler
+	// tests already cover the HTTP quota-denial and rollback paths, so this
+	// integration test exercises the DB-backed reservation race directly.
+	testutil.True(t, successes >= 1, fmt.Sprintf("expected at least 1 successful reservation, got %d", successes))
+	testutil.True(t, quotaExceeded >= 1, fmt.Sprintf("expected concurrent quota rejections, got successes=%d quotaExceeded=%d", successes, quotaExceeded))
 	testutil.Equal(t, 0, other)
 
 	info, err := storageSvc.GetUsage(context.Background(), userID)
 	testutil.NoError(t, err)
-	testutil.Equal(t, int64(successes*len(data)), info.BytesUsed)
+	testutil.Equal(t, int64(successes)*reservationSize, info.BytesUsed)
 
-	followUpStatus := uploadStatus(t, ts.URL, bucket, "post-race.txt", data, requestHeaders{token: token, tenantID: tenantID})
-	expectedStatus := http.StatusCreated
-	if info.BytesUsed+int64(len(data)) > 500 {
-		expectedStatus = http.StatusRequestEntityTooLarge
+	followUpErr := storageSvc.ReserveQuota(context.Background(), userID, reservationSize)
+	if info.BytesUsed+reservationSize > 500 {
+		testutil.True(t, errors.Is(followUpErr, storage.ErrQuotaExceeded), "expected follow-up reservation to exceed quota, got %v", followUpErr)
+	} else {
+		testutil.NoError(t, followUpErr)
 	}
-	testutil.StatusCode(t, expectedStatus, followUpStatus)
 }

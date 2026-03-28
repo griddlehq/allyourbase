@@ -54,15 +54,33 @@ test.describe("Vector Indexes Lifecycle (Full E2E)", () => {
 
     // Create a new vector index via UI
     await page.getByRole("button", { name: /Create Index/i }).click();
-    await expect(page.getByRole("heading", { name: /New Vector Index/i })).toBeVisible({ timeout: 5000 });
+    const createPanel = page.getByRole("region", { name: /New Vector Index/i });
+    await expect(createPanel.getByRole("heading", { name: /New Vector Index/i })).toBeVisible({
+      timeout: 5000,
+    });
 
-    await page.getByLabel("Schema").clear();
-    await page.getByLabel("Schema").fill("public");
-    await page.getByLabel("Table", { exact: true }).fill(tableName);
-    await page.getByLabel("Column").fill("embedding");
-    await page.getByLabel("Method").selectOption("hnsw");
-    await page.getByPlaceholder("cosine").fill("cosine");
-    await page.getByRole("button", { name: /^Create$/i }).click();
+    await createPanel.getByRole("textbox", { name: "Schema", exact: true }).fill("public");
+    await createPanel.getByRole("textbox", { name: "Table", exact: true }).fill(tableName);
+    await createPanel.getByRole("textbox", { name: "Column", exact: true }).fill("embedding");
+    await createPanel.getByRole("combobox", { name: "Method", exact: true }).selectOption("hnsw");
+    await createPanel.getByRole("textbox", { name: /Metric/i }).fill("cosine");
+    await createPanel.getByRole("button", { name: /^Create$/i }).click();
+
+    await expect
+      .poll(
+        async () => {
+          await page.reload();
+          await waitForDashboard(page);
+          await page.locator("aside").getByRole("button", { name: /^Vector Indexes$/i }).click();
+          return page
+            .getByRole("row", { name: new RegExp(tableName) })
+            .first()
+            .isVisible()
+            .catch(() => false);
+        },
+        { timeout: 30000 },
+      )
+      .toBe(true);
 
     // Verify the index appears in the list
     const indexRow = page.getByRole("row", { name: new RegExp(tableName) }).first();

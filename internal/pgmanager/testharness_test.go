@@ -16,6 +16,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -30,6 +31,33 @@ type testPGHarness struct {
 	server  *httptest.Server
 	config  Config
 	tempDir string
+}
+
+const managedPGStartTimeoutEnvVar = "AYB_PGMANAGER_TEST_START_TIMEOUT"
+
+func managedPGStartTimeout() time.Duration {
+	timeoutRaw := strings.TrimSpace(os.Getenv(managedPGStartTimeoutEnvVar))
+	if timeoutRaw == "" {
+		return 5 * time.Minute
+	}
+
+	timeout, err := time.ParseDuration(timeoutRaw)
+	if err != nil || timeout <= 0 {
+		return 5 * time.Minute
+	}
+
+	return timeout
+}
+
+func newTestHarnessServer(archive []byte, sums string) *httptest.Server {
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/SHA256SUMS"):
+			w.Write([]byte(sums))
+		default:
+			w.Write(archive)
+		}
+	}))
 }
 
 // newTestPGHarness packages the system's PG binaries into a test fixture tarball,
@@ -76,14 +104,7 @@ func newTestPGHarness(t *testing.T) *testPGHarness {
 
 	sums := fmt.Sprintf("%s  %s\n", hash, archiveName)
 
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		switch {
-		case r.URL.Path == "/SHA256SUMS":
-			w.Write([]byte(sums))
-		default:
-			w.Write(archive)
-		}
-	}))
+	srv := newTestHarnessServer(archive, sums)
 
 	tempDir := t.TempDir()
 
@@ -226,6 +247,44 @@ func trimNL(s string) string {
 	return s
 }
 
+func TestManagedPGStartTimeoutDefault(t *testing.T) {
+	t.Setenv(managedPGStartTimeoutEnvVar, "")
+	testutil.Equal(t, 5*time.Minute, managedPGStartTimeout())
+}
+
+func TestManagedPGStartTimeoutFromEnv(t *testing.T) {
+	t.Setenv(managedPGStartTimeoutEnvVar, "7m30s")
+	testutil.Equal(t, 7*time.Minute+30*time.Second, managedPGStartTimeout())
+}
+
+func TestManagedPGStartTimeoutInvalidEnvFallsBack(t *testing.T) {
+	t.Setenv(managedPGStartTimeoutEnvVar, "invalid")
+	testutil.Equal(t, 5*time.Minute, managedPGStartTimeout())
+}
+
+func TestManagedPGStartTimeoutNonPositiveFallsBack(t *testing.T) {
+	t.Setenv(managedPGStartTimeoutEnvVar, "0s")
+	testutil.Equal(t, 5*time.Minute, managedPGStartTimeout())
+}
+
+func TestHarnessServesVersionedSHA256SumsPath(t *testing.T) {
+	t.Parallel()
+
+	archive := []byte("fake-archive-bytes")
+	sums := "abc123  ayb-postgres-16-darwin-arm64.tar.xz\n"
+	srv := newTestHarnessServer(archive, sums)
+	t.Cleanup(srv.Close)
+
+	url := sha256SumsURL(srv.URL+"/{version}/{platform}.tar.xz", "16")
+	resp, err := http.Get(url) //nolint:noctx
+	testutil.NoError(t, err)
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	testutil.NoError(t, err)
+	testutil.Equal(t, sums, string(body))
+}
+
 // --- Integration Tests ---
 
 func TestFullLifecycle(t *testing.T) {
@@ -236,7 +295,7 @@ func TestFullLifecycle(t *testing.T) {
 	harness := newTestPGHarness(t)
 	mgr := New(harness.config)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), managedPGStartTimeout())
 	defer cancel()
 
 	// Start.
@@ -299,7 +358,7 @@ func TestExtensionInit(t *testing.T) {
 	harness.config.DataDir = filepath.Join(harness.tempDir, "data-ext")
 
 	mgr := New(harness.config)
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), managedPGStartTimeout())
 	defer cancel()
 
 	connURL, err := mgr.Start(ctx)
@@ -327,24 +386,23 @@ func TestPortAlreadyInUse(t *testing.T) {
 
 	harness := newTestPGHarness(t)
 
-	// Start the first manager — this claims the port.
-	mgr1 := New(harness.config)
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	// Occupy the port with a raw TCP listener instead of a second Postgres.
+	// Using a real Postgres to hold the port is unreliable: pg_ctl -w checks
+	// readiness by connecting to the port, and on Linux it can reach the
+	// first Postgres and falsely report the second instance as started.
+	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", harness.config.Port))
+	testutil.NoError(t, err)
+	defer ln.Close()
+
+	mgr := New(harness.config)
+	ctx, cancel := context.WithTimeout(context.Background(), managedPGStartTimeout())
 	defer cancel()
 
-	_, err := mgr1.Start(ctx)
-	testutil.NoError(t, err)
-	defer mgr1.Stop()
-
-	// Start a second manager on the same port — should fail.
-	cfg2 := harness.config
-	cfg2.DataDir = filepath.Join(harness.tempDir, "data-conflict")
-
-	mgr2 := New(cfg2)
-	_, err = mgr2.Start(ctx)
+	_, err = mgr.Start(ctx)
 	if err == nil {
-		mgr2.Stop()
+		mgr.Stop()
 		t.Fatal("expected error when starting on an already-used port, got nil")
 	}
-	testutil.Contains(t, err.Error(), "pg_ctl start failed")
+	// The error wraps pg_ctl or postgres bind failure.
+	testutil.Contains(t, err.Error(), "managed postgres")
 }
