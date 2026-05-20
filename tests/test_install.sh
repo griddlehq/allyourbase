@@ -466,3 +466,5 @@ printf "  Total: %d  Passed: \033[0;32m%d\033[0m  Failed: \033[0;31m%d\033[0m\n\
 if [ "$TESTS_FAILED" -gt 0 ]; then
   exit 1
 fi
+
+# stage5-prod-trigger-verification 2026-05-20
