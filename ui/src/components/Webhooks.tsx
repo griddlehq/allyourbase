@@ -79,9 +79,13 @@ export function Webhooks() {
     }
   };
 
-  const copyToClipboard = (text: string, label: string) => {
-    navigator.clipboard.writeText(text);
-    addToast("success", `${label} copied`);
+  const copyToClipboard = async (text: string, label: string) => {
+    try {
+      await navigator.clipboard.writeText(text);
+      addToast("success", `${label} copied`);
+    } catch (e) {
+      addToast("error", e instanceof Error ? e.message : `Failed to copy ${label}`);
+    }
   };
 
   const handleTest = async (hook: WebhookResponse) => {
@@ -233,7 +237,7 @@ export function Webhooks() {
                   </td>
                   <td className="px-4 py-2.5">
                     {hook.tables.length === 0 ? (
-                      <span className="text-gray-400 dark:text-gray-500 text-xs">all tables</span>
+                      <span className="text-gray-500 dark:text-gray-400 text-xs">all tables</span>
                     ) : (
                       <div className="flex gap-1 flex-wrap">
                         {hook.tables.map((t) => (

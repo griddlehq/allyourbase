@@ -233,11 +233,8 @@ func (h *Handler) handleUpdate(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if h.fieldEncryptor != nil {
-		if err := h.fieldEncryptor.EncryptRecord(tbl.Name, data); err != nil {
-			writeError(w, http.StatusInternalServerError, "internal error")
-			return
-		}
+	if !h.encryptUpdatedRecord(w, tbl, data) {
+		return
 	}
 
 	auditUpdate := h.auditSink != nil && h.auditSink.ShouldAudit(tbl.Name)
@@ -254,24 +251,8 @@ func (h *Handler) handleUpdate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	rows, err := q.Query(r.Context(), query, args...)
+	record, err := h.queryUpdatedRecord(w, r, q, done, tbl, query, args...)
 	if err != nil {
-		done(err)
-		if !mapPGError(w, err) {
-			h.logger.Error("update error", "error", err, "table", tbl.Name)
-			writeError(w, http.StatusInternalServerError, "internal error")
-		}
-		return
-	}
-
-	record, err := scanRow(rows)
-	rows.Close() // Close before done() to avoid pgx "conn busy" on commit.
-	if err != nil {
-		done(err)
-		if !mapPGError(w, err) {
-			h.logger.Error("scan error", "error", err, "table", tbl.Name)
-			writeError(w, http.StatusInternalServerError, "internal error")
-		}
 		return
 	}
 	if record == nil {
@@ -287,19 +268,8 @@ func (h *Handler) handleUpdate(w http.ResponseWriter, r *http.Request) {
 	// _audit_old_values from record so it won't appear in the API response.
 	oldRecord := extractOldRecord(record)
 
-	if auditUpdate {
-		if aerr := h.auditSink.LogMutationWithQuerier(r.Context(), q, audit.AuditEntry{
-			TableName: tbl.Name,
-			RecordID:  pkMap(tbl, record),
-			Operation: "UPDATE",
-			OldValues: oldRecord,
-			NewValues: record,
-		}); aerr != nil {
-			done(aerr)
-			h.logger.Error("audit log update failed", "error", aerr, "table", tbl.Name)
-			writeError(w, http.StatusInternalServerError, "internal error")
-			return
-		}
+	if !h.auditUpdatedRecord(w, r, q, done, tbl, record, oldRecord, auditUpdate) {
+		return
 	}
 
 	if err := done(nil); err != nil {
@@ -308,6 +278,77 @@ func (h *Handler) handleUpdate(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, http.StatusOK, record)
 	h.publishEvent("update", tbl.Name, record, oldRecord)
+}
+
+func (h *Handler) encryptUpdatedRecord(w http.ResponseWriter, tbl *schema.Table, data map[string]any) bool {
+	if h.fieldEncryptor == nil {
+		return true
+	}
+	if err := h.fieldEncryptor.EncryptRecord(tbl.Name, data); err != nil {
+		writeError(w, http.StatusInternalServerError, "internal error")
+		return false
+	}
+	return true
+}
+
+func (h *Handler) queryUpdatedRecord(
+	w http.ResponseWriter,
+	r *http.Request,
+	q Querier,
+	done func(error) error,
+	tbl *schema.Table,
+	query string,
+	args ...any,
+) (map[string]any, error) {
+	rows, err := q.Query(r.Context(), query, args...)
+	if err != nil {
+		done(err)
+		if !mapPGError(w, err) {
+			h.logger.Error("update error", "error", err, "table", tbl.Name)
+			writeError(w, http.StatusInternalServerError, "internal error")
+		}
+		return nil, err
+	}
+
+	record, err := scanRow(rows)
+	rows.Close() // Close before done() to avoid pgx "conn busy" on commit.
+	if err != nil {
+		done(err)
+		if !mapPGError(w, err) {
+			h.logger.Error("scan error", "error", err, "table", tbl.Name)
+			writeError(w, http.StatusInternalServerError, "internal error")
+		}
+		return nil, err
+	}
+	return record, nil
+}
+
+func (h *Handler) auditUpdatedRecord(
+	w http.ResponseWriter,
+	r *http.Request,
+	q Querier,
+	done func(error) error,
+	tbl *schema.Table,
+	record map[string]any,
+	oldRecord map[string]any,
+	auditUpdate bool,
+) bool {
+	if !auditUpdate {
+		return true
+	}
+	if aerr := h.auditSink.LogMutationWithQuerier(r.Context(), q, audit.AuditEntry{
+		TableName: tbl.Name,
+		RecordID:  pkMap(tbl, record),
+		Operation: "UPDATE",
+		OldValues: oldRecord,
+		NewValues: record,
+	}); aerr != nil {
+		done(aerr)
+		h.logger.Error("audit log update failed", "error", aerr, "table", tbl.Name)
+		writeError(w, http.StatusInternalServerError, "internal error")
+		return false
+	}
+	return true
 }
 
 // handleDelete handles DELETE /collections/{table}/{id}.

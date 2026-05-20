@@ -37,6 +37,13 @@ Migrate and start from Supabase:
 var registerBillingUsageSyncHandler = jobs.RegisterBillingUsageSyncHandler
 var registerBillingUsageSyncSchedule = jobs.RegisterBillingUsageSyncSchedule
 
+type startForegroundInput struct {
+	flags      map[string]string
+	configPath string
+	fromValue  string
+	branchName string
+}
+
 func init() {
 	startCmd.Flags().String("database-url", "", "PostgreSQL connection URL")
 	startCmd.Flags().Int("port", 0, "Server port (default 8090)")
@@ -85,26 +92,14 @@ func ensureConfiguredAdminPassword(cfg *config.Config) (string, error) {
 	return generatedPassword, nil
 }
 
-// TODO: Document runStartForeground.
+// runStartForeground runs the AYB server in the foreground, initializing the database, wiring all services, and blocking until a shutdown signal is received.
 func runStartForeground(cmd *cobra.Command, args []string) error {
-	flags := make(map[string]string)
-	if v, _ := cmd.Flags().GetString("database-url"); v != "" {
-		flags["database-url"] = v
+	input, err := readStartForegroundInput(cmd)
+	if err != nil {
+		return err
 	}
-	if v, _ := cmd.Flags().GetInt("port"); v != 0 {
-		flags["port"] = fmt.Sprintf("%d", v)
-	}
-	if v, _ := cmd.Flags().GetString("host"); v != "" {
-		flags["host"] = v
-	}
-	if v, _ := cmd.Flags().GetString("domain"); v != "" {
-		flags["tls-domain"] = v
-	}
-	configPath, _ := cmd.Flags().GetString("config")
-	fromValue, _ := cmd.Flags().GetString("from")
-	branchName, _ := cmd.Flags().GetString("branch")
 
-	cfg, err := config.Load(configPath, flags)
+	cfg, err := config.Load(input.configPath, input.flags)
 	if err != nil {
 		return fmt.Errorf("loading config: %w", err)
 	}
@@ -114,11 +109,8 @@ func runStartForeground(cmd *cobra.Command, args []string) error {
 		return err
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel, sigCh := newForegroundSignalContext()
 	defer cancel()
-
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP)
 	defer signal.Stop(sigCh)
 
 	isTTY := colorEnabled()
@@ -130,11 +122,11 @@ func runStartForeground(cmd *cobra.Command, args []string) error {
 	}
 	sp.header(bannerVersion(buildVersion))
 
-	if err := runForegroundPreflight(cfg, configPath, fromValue, logger); err != nil {
+	if err := runForegroundPreflight(cfg, input.configPath, input.fromValue, logger); err != nil {
 		return err
 	}
 
-	pool, pgMgr, schemaCache, watcherCancel, err := initDatabase(ctx, cfg, fromValue, branchName, sigCh, logger, sp)
+	pool, pgMgr, schemaCache, watcherCancel, err := initDatabase(ctx, cfg, input.fromValue, input.branchName, sigCh, logger, sp)
 	if err != nil {
 		return err
 	}
@@ -188,4 +180,46 @@ func runStartForeground(cmd *cobra.Command, args []string) error {
 	defer readyCleanup()
 
 	return runGracefulShutdown(ctx, errCh, sigCh, watcherCancel, state, pgMgr, logger)
+}
+
+func readStartForegroundInput(cmd *cobra.Command) (startForegroundInput, error) {
+	input := startForegroundInput{flags: make(map[string]string)}
+	if v, err := cmd.Flags().GetString("database-url"); err != nil {
+		return input, err
+	} else if v != "" {
+		input.flags["database-url"] = v
+	}
+	if v, err := cmd.Flags().GetInt("port"); err != nil {
+		return input, err
+	} else if v != 0 {
+		input.flags["port"] = fmt.Sprintf("%d", v)
+	}
+	if v, err := cmd.Flags().GetString("host"); err != nil {
+		return input, err
+	} else if v != "" {
+		input.flags["host"] = v
+	}
+	if v, err := cmd.Flags().GetString("domain"); err != nil {
+		return input, err
+	} else if v != "" {
+		input.flags["tls-domain"] = v
+	}
+	var err error
+	input.configPath, err = cmd.Flags().GetString("config")
+	if err != nil {
+		return input, err
+	}
+	input.fromValue, err = cmd.Flags().GetString("from")
+	if err != nil {
+		return input, err
+	}
+	input.branchName, err = cmd.Flags().GetString("branch")
+	return input, err
+}
+
+func newForegroundSignalContext() (context.Context, context.CancelFunc, chan os.Signal) {
+	ctx, cancel := context.WithCancel(context.Background())
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP)
+	return ctx, cancel, sigCh
 }

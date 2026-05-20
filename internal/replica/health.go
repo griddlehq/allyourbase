@@ -1,4 +1,3 @@
-// Package replica Stub summary for /Users/stuart/parallel_development/allyourbase_dev/MAR18_WS_C_phase5_features_and_phase6/allyourbase_dev/internal/replica/health.go.
 package replica
 
 import (
@@ -6,8 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"net/url"
-	"strings"
+	"math/rand/v2"
 	"sync"
 	"time"
 
@@ -22,11 +20,12 @@ const (
 
 var errReplicaNotFoundInReplication = errors.New("replica not found in pg_stat_replication")
 
-var sensitiveReplicaURLQueryKeys = map[string]struct{}{
-	"password":    {},
-	"passfile":    {},
-	"sslpassword": {},
-	"user":        {},
+// defaultHealthJitter adds ±20% jitter to a base duration to prevent
+// synchronized health checks from multiple AYB instances (thundering herd
+// on pg_stat_replication).
+func defaultHealthJitter(base time.Duration) time.Duration {
+	jitterRange := base / 5 // 20%
+	return base - jitterRange + time.Duration(rand.Int64N(int64(2*jitterRange)+1))
 }
 
 type ReplicaHealth int
@@ -68,7 +67,6 @@ type replicationLagRow struct {
 	LagBytes        int64
 }
 
-// HealthChecker monitors replica database health by periodically checking connectivity and replication lag, transitioning replicas between healthy, suspect, and unhealthy states, and updating a PoolRouter with the list of healthy replicas.
 type HealthChecker struct {
 	router    *PoolRouter
 	statuses  []*ReplicaStatus
@@ -85,10 +83,10 @@ type HealthChecker struct {
 	lagCheckFn        func(ctx context.Context, status *ReplicaStatus) (int64, error)
 	replicationRowsFn func(ctx context.Context) ([]replicationLagRow, error)
 	nowFn             func() time.Time
+	jitterFn          func(base time.Duration) time.Duration
 	afterCycleHook    func()
 }
 
-// NewHealthChecker creates and initializes a HealthChecker for the given router, check interval, and logger. If interval is zero or negative, defaultHealthCheckInterval is used. It initializes status tracking for each replica in the router.
 func NewHealthChecker(router *PoolRouter, interval time.Duration, logger *slog.Logger) *HealthChecker {
 	if interval <= 0 {
 		interval = defaultHealthCheckInterval
@@ -103,6 +101,7 @@ func NewHealthChecker(router *PoolRouter, interval time.Duration, logger *slog.L
 		interval: interval,
 		stopCh:   make(chan struct{}),
 		nowFn:    time.Now,
+		jitterFn: defaultHealthJitter,
 	}
 
 	if router != nil {
@@ -198,7 +197,6 @@ func (h *HealthChecker) checkReplica(ctx context.Context, status *ReplicaStatus)
 	h.applyCheckResult(status, true, lagBytes, nil)
 }
 
-// checkLag queries the primary's pg_stat_replication view, identifies the matching replica using connection hints, and returns the replication lag in bytes if within acceptable limits.
 func (h *HealthChecker) checkLag(ctx context.Context, status *ReplicaStatus) (int64, error) {
 	if status == nil {
 		return 0, errors.New("replica status is nil")
@@ -209,7 +207,15 @@ func (h *HealthChecker) checkLag(ctx context.Context, status *ReplicaStatus) (in
 		return 0, err
 	}
 
-	hints := parseReplicaHints(status.Config.URL)
+	hints, parseErr := parseReplicaHints(status.Config.URL)
+	if parseErr != nil {
+		// Bad replica URL — lag check will fail. Log so operators can
+		// trace "replica not found" back to a config problem.
+		h.logger.Warn("replica URL parse failed; lag check will not match",
+			slog.String("url", SanitizeReplicaURL(status.Config.URL)),
+			slog.Any("error", parseErr),
+		)
+	}
 	row, ok := selectReplicationLagRow(rows, hints)
 	if !ok {
 		return 0, errReplicaNotFoundInReplication
@@ -219,93 +225,6 @@ func (h *HealthChecker) checkLag(ctx context.Context, status *ReplicaStatus) (in
 		return row.LagBytes, fmt.Errorf("replica lag %d exceeds max %d", row.LagBytes, status.Config.MaxLagBytes)
 	}
 	return row.LagBytes, nil
-}
-
-func parseReplicaHints(rawURL string) replicaHints {
-	parsed, err := url.Parse(rawURL)
-	if err != nil {
-		return replicaHints{}
-	}
-
-	return replicaHints{
-		host:            strings.ToLower(parsed.Hostname()),
-		applicationName: parsed.Query().Get("application_name"),
-	}
-}
-
-type replicaHints struct {
-	host            string
-	applicationName string
-}
-
-// selectReplicationLagRow finds a replication lag row matching the given hints using a scoring system that prioritizes rows matching both host and application name. Returns false if no row matches or if multiple rows tie with the same score.
-func selectReplicationLagRow(rows []replicationLagRow, hints replicaHints) (replicationLagRow, bool) {
-	var (
-		selected  replicationLagRow
-		found     bool
-		ambiguous bool
-		bestScore int
-	)
-
-	for _, row := range rows {
-		score := rowMatchScore(row, hints)
-		if score == 0 {
-			continue
-		}
-
-		if !found || score > bestScore {
-			selected = row
-			bestScore = score
-			found = true
-			ambiguous = false
-			continue
-		}
-
-		if score == bestScore {
-			ambiguous = true
-		}
-	}
-
-	if !found || ambiguous {
-		return replicationLagRow{}, false
-	}
-
-	return selected, true
-}
-
-func rowMatchScore(row replicationLagRow, hints replicaHints) int {
-	score := 0
-	if hints.applicationName != "" && row.ApplicationName == hints.applicationName {
-		score++
-	}
-	if hints.host != "" && strings.EqualFold(row.ClientAddr, hints.host) {
-		score++
-	}
-	return score
-}
-
-// SanitizeReplicaURL removes credentials and sensitive query parameters before
-// a replica connection string crosses a log, metric, or admin-response boundary.
-func SanitizeReplicaURL(rawURL string) string {
-	rawURL = strings.TrimSpace(rawURL)
-	if rawURL == "" {
-		return ""
-	}
-
-	parsed, err := url.Parse(rawURL)
-	if err != nil {
-		return "<invalid-replica-url>"
-	}
-
-	parsed.User = nil
-	values := parsed.Query()
-	for key := range values {
-		if _, sensitive := sensitiveReplicaURLQueryKeys[strings.ToLower(strings.TrimSpace(key))]; sensitive {
-			values.Del(key)
-		}
-	}
-	parsed.RawQuery = values.Encode()
-	return parsed.String()
 }
 
 // applyCheckResult updates a replica's state based on check success or failure, tracking consecutive successes and failures, and transitioning between healthy, suspect, and unhealthy states. State changes are logged as warnings.
@@ -395,24 +314,31 @@ func (h *HealthChecker) RunCheck(ctx context.Context) {
 	h.runCheckCycle(ctx)
 }
 
-// Start launches a background goroutine that immediately runs one check cycle, then periodically runs additional cycles at the configured interval until Stop is called.
 func (h *HealthChecker) Start() {
 	h.startOnce.Do(func() {
 		h.wg.Add(1)
 		go func() {
 			defer h.wg.Done()
+			defer func() {
+				if r := recover(); r != nil {
+					h.logger.Error("replica health checker panic recovered", "panic", r)
+				}
+			}()
 
 			h.runCheckCycle(context.Background())
 
-			ticker := time.NewTicker(h.interval)
-			defer ticker.Stop()
+			// Use a timer with jitter instead of a fixed ticker to prevent
+			// synchronized health checks across multiple AYB instances.
+			timer := time.NewTimer(h.jitterFn(h.interval))
+			defer timer.Stop()
 
 			for {
 				select {
 				case <-h.stopCh:
 					return
-				case <-ticker.C:
+				case <-timer.C:
 					h.runCheckCycle(context.Background())
+					timer.Reset(h.jitterFn(h.interval))
 				}
 			}
 		}()
@@ -441,7 +367,7 @@ func (h *HealthChecker) Statuses() []ReplicaStatus {
 	return snapshot
 }
 
-// TODO: Document HealthChecker.AddStatus.
+// AddStatus registers a new replica pool for health monitoring, initializing it as healthy.
 func (h *HealthChecker) AddStatus(pool *pgxpool.Pool, name string, cfg ReplicaConfig) {
 	if pool == nil {
 		return
@@ -459,7 +385,7 @@ func (h *HealthChecker) AddStatus(pool *pgxpool.Pool, name string, cfg ReplicaCo
 	})
 }
 
-// TODO: Document HealthChecker.RemoveStatus.
+// RemoveStatus removes the health-tracking entry for the given replica pool.
 func (h *HealthChecker) RemoveStatus(pool *pgxpool.Pool) {
 	if pool == nil {
 		return

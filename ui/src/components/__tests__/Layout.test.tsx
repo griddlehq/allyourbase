@@ -154,6 +154,16 @@ describe("Layout", () => {
       <Layout schema={twoTableSchema} onLogout={onLogout} onRefresh={onRefresh} />,
     );
     expect(screen.getByTestId("table-browser")).toBeInTheDocument();
+    const schemaTabClasses = screen
+      .getByRole("button", { name: "Schema" })
+      .className.split(" ");
+    const sqlTabClasses = screen
+      .getByRole("button", { name: "SQL" })
+      .className.split(" ");
+    expect(schemaTabClasses).toContain("text-gray-600");
+    expect(schemaTabClasses).not.toContain("text-gray-500");
+    expect(sqlTabClasses).toContain("text-gray-600");
+    expect(sqlTabClasses).not.toContain("text-gray-500");
   });
 
   it("shows empty state when no tables", () => {
@@ -161,7 +171,22 @@ describe("Layout", () => {
       <Layout schema={makeSchema()} onLogout={onLogout} onRefresh={onRefresh} />,
     );
     expect(screen.getByText("No tables yet")).toBeInTheDocument();
+    const sidebarHelperClasses = screen
+      .getByText("Create your first table to get started.")
+      .className.split(" ");
+    expect(sidebarHelperClasses).toContain("text-gray-500");
+    expect(sidebarHelperClasses).not.toContain("text-gray-400");
     expect(screen.getByText("Select a table from the sidebar")).toBeInTheDocument();
+    const emptyStateClasses = screen
+      .getByText("Select a table from the sidebar")
+      .parentElement?.className.split(" ");
+    expect(emptyStateClasses).toContain("text-gray-500");
+    expect(emptyStateClasses).not.toContain("text-gray-400");
+    const helperTextClasses = screen
+      .getByText("Use SQL Editor from the sidebar to create one.")
+      .className.split(" ");
+    expect(helperTextClasses).toContain("text-gray-600");
+    expect(helperTextClasses).not.toContain("text-gray-400");
   });
 
   it("keeps a single Open SQL Editor CTA owner in empty-schema surfaces", () => {
@@ -258,7 +283,13 @@ describe("Layout", () => {
       <Layout schema={schema} onLogout={onLogout} onRefresh={onRefresh} />,
     );
     // "other." appears in sidebar and header, so use getAllByText.
-    expect(screen.getAllByText("other.").length).toBeGreaterThanOrEqual(1);
+    const prefixes = screen.getAllByText("other.");
+    expect(prefixes.length).toBeGreaterThanOrEqual(1);
+    for (const prefix of prefixes) {
+      const classes = prefix.className.split(" ");
+      expect(classes).toContain("text-gray-600");
+      expect(classes).not.toContain("text-gray-400");
+    }
     expect(screen.getAllByText("events").length).toBeGreaterThanOrEqual(1);
   });
 
@@ -269,7 +300,11 @@ describe("Layout", () => {
     renderWithTheme(
       <Layout schema={schema} onLogout={onLogout} onRefresh={onRefresh} />,
     );
-    expect(screen.getByText("view")).toBeInTheDocument();
+    const badge = screen.getByText("view");
+    expect(badge).toBeInTheDocument();
+    const badgeClasses = badge.className.split(" ");
+    expect(badgeClasses).toContain("text-gray-600");
+    expect(badgeClasses).not.toContain("text-gray-500");
   });
 
   it("renders sidebar sections with Database, Services, and Admin groups", () => {
@@ -285,6 +320,18 @@ describe("Layout", () => {
     expect(screen.getByText("Functions")).toBeInTheDocument();
     expect(screen.getByText("SQL Editor")).toBeInTheDocument();
     expect(screen.getByText("RLS Policies")).toBeInTheDocument();
+  });
+
+  it("sidebar section titles use WCAG AA compliant contrast tokens", () => {
+    renderWithTheme(
+      <Layout schema={twoTableSchema} onLogout={onLogout} onRefresh={onRefresh} />,
+    );
+    // Section titles like "Database" should use text-gray-500 (4.56:1 on white)
+    // not text-gray-400 (2.53:1) — check standalone token, not dark: prefix
+    const databaseTitle = screen.getByText("Database");
+    const classes = databaseTitle.className.split(" ");
+    expect(classes).toContain("text-gray-500");
+    expect(classes).not.toContain("text-gray-400");
   });
 
   it("switches to webhooks view on Webhooks click", async () => {

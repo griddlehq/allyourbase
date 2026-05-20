@@ -1,4 +1,4 @@
-.PHONY: build dev test test-sdk test-ui test-integration test-demo-smoke test-demo-e2e test-e2e test-smoke test-browser-full test-full test-all test-everything test-api-smoke lint check check-sizes check-ui-lint check-browser-tests-lint check-func-sizes check-installer check-sync-pipeline check-sdk-build release-candidate-check clean ui demos release docker docker-runtime-smoke help sync-openapi build-postgres load-admin-status load-admin-status-local load-auth-request-path load-auth-request-path-local load-data-path load-data-path-local load-data-pool-pressure load-data-pool-pressure-local load-http-100 load-http-500 load-http-1000 load-realtime-ws load-realtime-ws-local load-realtime-ws-1000 load-realtime-ws-5000 load-realtime-ws-10000 load-sustained-soak load-sustained-soak-local
+.PHONY: build dev test test-sdk test-sdk-go test-sdk-python test-sdk-dart test-sdk-swift test-sdk-kotlin test-sdk-react test-sdk-ssr test-sdk-all test-ui test-integration test-demo-smoke test-demo-e2e test-e2e test-smoke test-browser-full test-full test-all test-everything test-api-smoke test-api-journey lint check check-sizes check-ui-lint check-browser-tests-lint check-func-sizes check-installer check-sync-pipeline check-sdk-build release-candidate-check clean ui demos release docker docker-runtime-smoke help sync-openapi build-postgres load-admin-status load-admin-status-local load-auth-request-path load-auth-request-path-local load-data-path load-data-path-local load-data-pool-pressure load-data-pool-pressure-local load-http-100 load-http-100-local load-http-500 load-http-500-local load-http-1000 load-http-1000-local load-realtime-ws load-realtime-ws-local load-realtime-ws-1000 load-realtime-ws-1000-local load-realtime-ws-5000 load-realtime-ws-5000-local load-realtime-ws-10000 load-realtime-ws-10000-local load-sustained-soak load-sustained-soak-local
 
 # Build variables
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
@@ -27,6 +27,7 @@ LOAD_DATA_PATH_K6_COMMAND := $(LOAD_K6_BIN) run --vus $${K6_VUS:-$(LOAD_DEFAULT_
 LOAD_DATA_POOL_PRESSURE_K6_COMMAND := AYB_POOL_PRESSURE_VUS=$${K6_VUS:-$(LOAD_DEFAULT_VUS)} AYB_POOL_PRESSURE_ITERATIONS=$${K6_ITERATIONS:-$(LOAD_DEFAULT_ITERATIONS)} env -u K6_VUS -u K6_ITERATIONS $(LOAD_K6_BIN) run $(LOAD_DATA_POOL_PRESSURE_SCENARIO)
 LOAD_REALTIME_WS_K6_COMMAND := $(LOAD_K6_BIN) run --vus $${K6_VUS:-$(LOAD_DEFAULT_VUS)} --iterations $${K6_ITERATIONS:-$(LOAD_DEFAULT_ITERATIONS)} $(LOAD_REALTIME_WS_SCENARIO)
 LOAD_SUSTAINED_SOAK_K6_COMMAND := $(LOAD_K6_BIN) run $(LOAD_SUSTAINED_SOAK_SCENARIO)
+LOAD_LOCAL_AYB_START_COMMAND := ./ayb start --foreground --config tests/load/ayb-load.toml
 
 define LOAD_BOOTSTRAP_FUNCTIONS
 set -euo pipefail; \
@@ -36,29 +37,68 @@ load_export_env() { \
 	export AYB_RATE_LIMIT_API_ANONYMOUS="$${AYB_RATE_LIMIT_API_ANONYMOUS:-$(LOAD_API_ANON_RATE_LIMIT_DEFAULT)}"; \
 	export AYB_BASE_URL="$${AYB_BASE_URL:-$(LOAD_DEFAULT_BASE_URL)}"; \
 }; \
-load_export_auth_env() { \
-	local resolved_auth_jwt_secret="$${AYB_AUTH_JWT_SECRET:-}"; \
-	if [ -z "$$resolved_auth_jwt_secret" ]; then \
-		resolved_auth_jwt_secret="$$(python3 -c "import secrets; print(secrets.token_urlsafe(48))")"; \
-	fi; \
-	export AYB_AUTH_ENABLED="$${AYB_AUTH_ENABLED:-$(LOAD_AUTH_ENABLED_DEFAULT)}"; \
-	export AYB_AUTH_JWT_SECRET="$$resolved_auth_jwt_secret"; \
-}; \
-load_resolve_admin_token() { \
-	local resolved_admin_token="$${AYB_ADMIN_TOKEN:-}"; \
-	if [ -z "$$resolved_admin_token" ] && [ -f "$${HOME}/.ayb/admin-token" ]; then \
-		local admin_password login_payload login_response; \
-		admin_password="$$(head -n 1 "$${HOME}/.ayb/admin-token" | sed 's/\r$$//')"; \
-		if [ -n "$$admin_password" ]; then \
-			login_payload="$$(python3 -c "import json,sys; print(json.dumps(dict(password=sys.argv[1])))" "$$admin_password")"; \
-			login_response="$$(curl -fsS -H "Content-Type: application/json" --data "$$login_payload" "$${AYB_BASE_URL%/}/api/admin/auth" 2>/dev/null || true)"; \
-			if [ -n "$$login_response" ]; then \
-				resolved_admin_token="$$(printf "%s" "$$login_response" | python3 -c "import json,sys; print(json.load(sys.stdin).get(\"token\", \"\"))" 2>/dev/null || true)"; \
+	load_export_auth_env() { \
+		local resolved_auth_jwt_secret="$${AYB_AUTH_JWT_SECRET:-}"; \
+		if [ -z "$$resolved_auth_jwt_secret" ]; then \
+			resolved_auth_jwt_secret="$$(python3 -c "import secrets; print(secrets.token_urlsafe(48))")"; \
+		fi; \
+		export AYB_AUTH_ENABLED="$${AYB_AUTH_ENABLED:-$(LOAD_AUTH_ENABLED_DEFAULT)}"; \
+		export AYB_AUTH_JWT_SECRET="$$resolved_auth_jwt_secret"; \
+	}; \
+	load_export_admin_password_env() { \
+		local resolved_admin_password="$${AYB_ADMIN_PASSWORD:-}"; \
+		if [ -z "$$resolved_admin_password" ]; then \
+			resolved_admin_password="$$(python3 -c "import secrets; print(secrets.token_urlsafe(36))")"; \
+		fi; \
+		export AYB_ADMIN_PASSWORD="$$resolved_admin_password"; \
+	}; \
+	load_base_url_is_loopback() { \
+		local _url="$${AYB_BASE_URL:-$(LOAD_DEFAULT_BASE_URL)}"; \
+		local _hp="$${_url#*://}"; _hp="$${_hp%%/*}"; _hp="$${_hp%%\?*}"; \
+		local _host; \
+		case "$$_hp" in \
+			\[*) _host="$${_hp#\[}"; _host="$${_host%%]*}" ;; \
+			*) _host="$${_hp%%:*}" ;; \
+		esac; \
+		case "$$_host" in \
+			localhost|127.0.0.1|::1) return 0 ;; \
+			*) return 1 ;; \
+		esac; \
+	}; \
+	load_exchange_admin_password_for_token() { \
+		local admin_password="$$1"; \
+		local login_payload login_response; \
+		if [ -z "$$admin_password" ]; then \
+			return 0; \
+		fi; \
+		login_payload="$$(python3 -c "import json,sys; print(json.dumps(dict(password=sys.argv[1])))" "$$admin_password")"; \
+		login_response="$$(curl -fsS -H "Content-Type: application/json" --data "$$login_payload" "$${AYB_BASE_URL%/}/api/admin/auth" 2>/dev/null || true)"; \
+		if [ -n "$$login_response" ]; then \
+			printf "%s" "$$login_response" | python3 -c "import json,sys; print(json.load(sys.stdin).get(\"token\", \"\"))" 2>/dev/null || true; \
+		fi; \
+	}; \
+	load_resolve_admin_token() { \
+		local resolved_admin_token="$${AYB_ADMIN_TOKEN:-}"; \
+		local admin_password_from_file; \
+		if [ -z "$$resolved_admin_token" ] && ! load_base_url_is_loopback; then \
+			printf "AYB_ADMIN_TOKEN must be set for non-loopback AYB_BASE_URL; refusing ~/.ayb/admin-token fallback for %s\n" "$$AYB_BASE_URL" >&2; \
+			return 1; \
+		fi; \
+		if [ -z "$$resolved_admin_token" ]; then \
+			resolved_admin_token="$$(load_exchange_admin_password_for_token "$${AYB_ADMIN_PASSWORD:-}")"; \
+		fi; \
+		if [ -z "$$resolved_admin_token" ] && [ -f "$${HOME}/.ayb/admin-token" ]; then \
+			admin_password_from_file="$$(head -n 1 "$${HOME}/.ayb/admin-token" | sed 's/\r$$//')"; \
+			if [ -n "$$admin_password_from_file" ]; then \
+				resolved_admin_token="$$(load_exchange_admin_password_for_token "$$admin_password_from_file")"; \
 			fi; \
 		fi; \
-	fi; \
-	export AYB_ADMIN_TOKEN="$$resolved_admin_token"; \
-}
+		if [ -z "$$resolved_admin_token" ]; then \
+			printf "Unable to resolve AYB admin token: set AYB_ADMIN_TOKEN or provide valid AYB_ADMIN_PASSWORD/~/.ayb/admin-token for %s\n" "$$AYB_BASE_URL" >&2; \
+			return 1; \
+		fi; \
+		export AYB_ADMIN_TOKEN="$$resolved_admin_token"; \
+	}
 endef
 
 define BROWSER_EXPORT_AUTH_ENV
@@ -112,6 +152,36 @@ test: ## Run Go unit tests (no DB, fast)
 test-sdk: ## Run SDK unit tests (vitest, no browser)
 	cd sdk && npm test
 
+test-sdk-go: ## Run Go SDK checks
+	cd sdk_go && go vet ./... && go test -count=1 ./...
+
+test-sdk-python: ## Run Python SDK checks
+	cd sdk_python && python3 -m pip install ".[dev]" -q && python3 -m ruff check src/ --ignore E501 && python3 -m pytest
+
+test-sdk-dart: ## Run Dart SDK checks
+	cd sdk_dart && dart pub get && dart analyze && dart test
+
+test-sdk-swift: ## Run Swift SDK build + tests (macOS)
+	cd sdk_swift && swift build && swift run AllyourbaseTestRunner
+
+test-sdk-kotlin: ## Run Kotlin SDK tests (requires JDK)
+	cd sdk_kotlin && ./gradlew test
+
+test-sdk-react: ## Run React SDK checks (requires JS SDK deps for relative source imports)
+	cd sdk && npm ci && cd ../sdk_react && pnpm install && pnpm test
+
+test-sdk-ssr: ## Run SSR SDK checks (requires JS SDK deps for relative source imports)
+	cd sdk && npm ci && cd ../sdk_ssr && pnpm install && pnpm test
+
+test-sdk-all: ## Run all locally-runnable SDK checks (excludes Kotlin)
+	$(MAKE) test-sdk
+	$(MAKE) test-sdk-go
+	$(MAKE) test-sdk-python
+	$(MAKE) test-sdk-dart
+	$(MAKE) test-sdk-swift
+	$(MAKE) test-sdk-react
+	$(MAKE) test-sdk-ssr
+
 test-ui: ## Run UI component tests (vitest + jsdom, no browser)
 	cd ui && pnpm test
 
@@ -134,25 +204,25 @@ load-admin-status: ## Run direct k6 baseline scenario against AYB_BASE_URL (defa
 	@bash -lc '$(LOAD_BOOTSTRAP_FUNCTIONS); load_export_env; load_resolve_admin_token; $(LOAD_ADMIN_STATUS_K6_COMMAND)'
 
 load-admin-status-local: ## Start local AYB with run-with-ayb and run the baseline k6 scenario
-	@bash -lc '$(LOAD_BOOTSTRAP_FUNCTIONS); export -f load_resolve_admin_token; load_export_env; bash scripts/run-with-ayb.sh "load_resolve_admin_token; $(LOAD_ADMIN_STATUS_K6_COMMAND)"'
+	@bash -lc '$(LOAD_BOOTSTRAP_FUNCTIONS); export -f load_base_url_is_loopback load_exchange_admin_password_for_token load_resolve_admin_token; load_export_env; load_export_admin_password_env; bash scripts/run-with-ayb.sh "load_resolve_admin_token && $(LOAD_ADMIN_STATUS_K6_COMMAND)"'
 
 load-auth-request-path: ## Run direct k6 auth register/login/refresh scenario against AYB_BASE_URL
 	@bash -lc '$(LOAD_BOOTSTRAP_FUNCTIONS); load_export_env; load_export_auth_env; load_resolve_admin_token; $(LOAD_AUTH_REQUEST_PATH_K6_COMMAND)'
 
 load-auth-request-path-local: ## Start local AYB with run-with-ayb and run the auth register/login/refresh scenario
-	@bash -lc '$(LOAD_BOOTSTRAP_FUNCTIONS); export -f load_resolve_admin_token; load_export_env; load_export_auth_env; bash scripts/run-with-ayb.sh "load_resolve_admin_token; $(LOAD_AUTH_REQUEST_PATH_K6_COMMAND)"'
+	@bash -lc '$(LOAD_BOOTSTRAP_FUNCTIONS); export -f load_base_url_is_loopback load_exchange_admin_password_for_token load_resolve_admin_token; load_export_env; load_export_auth_env; load_export_admin_password_env; bash scripts/run-with-ayb.sh "load_resolve_admin_token && $(LOAD_AUTH_REQUEST_PATH_K6_COMMAND)"'
 
 load-data-path: ## Run direct k6 collection CRUD/batch data-path scenario against AYB_BASE_URL
 	@bash -lc '$(LOAD_BOOTSTRAP_FUNCTIONS); load_export_env; load_export_auth_env; load_resolve_admin_token; $(LOAD_DATA_PATH_K6_COMMAND)'
 
 load-data-path-local: ## Start local AYB with run-with-ayb and run the collection CRUD/batch data-path scenario
-	@bash -lc '$(LOAD_BOOTSTRAP_FUNCTIONS); export -f load_resolve_admin_token; load_export_env; load_export_auth_env; bash scripts/run-with-ayb.sh "load_resolve_admin_token; $(LOAD_DATA_PATH_K6_COMMAND)"'
+	@bash -lc '$(LOAD_BOOTSTRAP_FUNCTIONS); export -f load_base_url_is_loopback load_exchange_admin_password_for_token load_resolve_admin_token; load_export_env; load_export_auth_env; load_export_admin_password_env; bash scripts/run-with-ayb.sh "load_resolve_admin_token && $(LOAD_DATA_PATH_K6_COMMAND)"'
 
 load-data-pool-pressure: ## Run direct k6 admin SQL pool-pressure scenario against AYB_BASE_URL
 	@bash -lc '$(LOAD_BOOTSTRAP_FUNCTIONS); load_export_env; load_resolve_admin_token; $(LOAD_DATA_POOL_PRESSURE_K6_COMMAND)'
 
 load-data-pool-pressure-local: ## Start local AYB with run-with-ayb and run the admin SQL pool-pressure scenario
-	@bash -lc '$(LOAD_BOOTSTRAP_FUNCTIONS); export -f load_resolve_admin_token; load_export_env; bash scripts/run-with-ayb.sh "load_resolve_admin_token; $(LOAD_DATA_POOL_PRESSURE_K6_COMMAND)"'
+	@bash -lc '$(LOAD_BOOTSTRAP_FUNCTIONS); export -f load_base_url_is_loopback load_exchange_admin_password_for_token load_resolve_admin_token; load_export_env; load_export_admin_password_env; bash scripts/run-with-ayb.sh "load_resolve_admin_token && $(LOAD_DATA_POOL_PRESSURE_K6_COMMAND)"'
 
 load-http-100: ## Run direct HTTP load scenario suite at 100 VUs/iterations per scenario
 	@K6_VUS=100 K6_ITERATIONS=100 $(MAKE) load-admin-status
@@ -172,26 +242,51 @@ load-http-1000: ## Run direct HTTP load scenario suite at 1000 VUs/iterations pe
 	@K6_VUS=1000 K6_ITERATIONS=1000 $(MAKE) load-data-path
 	@K6_VUS=1000 K6_ITERATIONS=1000 $(MAKE) load-data-pool-pressure
 
+define LOAD_REQUIRE_UNSAFE_LOCAL_TIER
+if [ "$${AYB_LOAD_UNSAFE:-}" != "1" ]; then \
+	printf "Refusing dangerous local load tier '%s': set AYB_LOAD_UNSAFE=1 to continue\n" "$(1)" >&2; \
+	exit 1; \
+fi;
+endef
+
+load-http-100-local: ## Start local AYB with pg_cron-free load config and run the HTTP load suite at 100 VUs/iterations
+	@bash -lc '$(LOAD_BOOTSTRAP_FUNCTIONS); load_export_env; load_export_auth_env; load_export_admin_password_env; export AYB_START_COMMAND="$${AYB_START_COMMAND:-$(LOAD_LOCAL_AYB_START_COMMAND)}"; bash scripts/run-with-ayb.sh "$(MAKE) load-http-100"'
+
+load-http-500-local: ## Start local AYB with pg_cron-free load config and run the HTTP load suite at 500 VUs/iterations
+	@bash -lc '$(LOAD_BOOTSTRAP_FUNCTIONS); load_export_env; load_export_auth_env; load_export_admin_password_env; export AYB_START_COMMAND="$${AYB_START_COMMAND:-$(LOAD_LOCAL_AYB_START_COMMAND)}"; bash scripts/run-with-ayb.sh "$(MAKE) load-http-500"'
+
+load-http-1000-local: ## DANGEROUS local HTTP load tier (1000 VUs/iterations); requires AYB_LOAD_UNSAFE=1
+	@bash -lc '$(call LOAD_REQUIRE_UNSAFE_LOCAL_TIER,load-http-1000-local) $(LOAD_BOOTSTRAP_FUNCTIONS); load_export_env; load_export_auth_env; load_export_admin_password_env; export AYB_START_COMMAND="$${AYB_START_COMMAND:-$(LOAD_LOCAL_AYB_START_COMMAND)}"; bash scripts/run-with-ayb.sh "$(MAKE) load-http-1000"'
+
 load-realtime-ws: ## Run direct k6 realtime websocket subscribe scenario against AYB_BASE_URL
 	@bash -lc '$(LOAD_BOOTSTRAP_FUNCTIONS); load_export_env; load_export_auth_env; load_resolve_admin_token; $(LOAD_REALTIME_WS_K6_COMMAND)'
 
 load-realtime-ws-local: ## Start local AYB with run-with-ayb and run the realtime websocket subscribe scenario
-	@bash -lc '$(LOAD_BOOTSTRAP_FUNCTIONS); export -f load_resolve_admin_token; load_export_env; load_export_auth_env; bash scripts/run-with-ayb.sh "load_resolve_admin_token; $(LOAD_REALTIME_WS_K6_COMMAND)"'
+	@bash -lc '$(LOAD_BOOTSTRAP_FUNCTIONS); export -f load_base_url_is_loopback load_exchange_admin_password_for_token load_resolve_admin_token; load_export_env; load_export_auth_env; load_export_admin_password_env; bash scripts/run-with-ayb.sh "load_resolve_admin_token && $(LOAD_REALTIME_WS_K6_COMMAND)"'
 
 load-realtime-ws-1000: ## Run direct realtime websocket scenario at 1000 VUs/iterations
 	@K6_VUS=1000 K6_ITERATIONS=1000 $(MAKE) load-realtime-ws
 
+load-realtime-ws-1000-local: ## Start local AYB with pg_cron-free load config and run realtime websocket scenario at 1000 VUs/iterations
+	@bash -lc '$(LOAD_BOOTSTRAP_FUNCTIONS); load_export_env; load_export_auth_env; load_export_admin_password_env; export AYB_START_COMMAND="$${AYB_START_COMMAND:-$(LOAD_LOCAL_AYB_START_COMMAND)}"; bash scripts/run-with-ayb.sh "K6_VUS=1000 K6_ITERATIONS=1000 $(MAKE) load-realtime-ws"'
+
 load-realtime-ws-5000: ## Run direct realtime websocket scenario at 5000 VUs/iterations
 	@K6_VUS=5000 K6_ITERATIONS=5000 $(MAKE) load-realtime-ws
 
+load-realtime-ws-5000-local: ## DANGEROUS local realtime websocket load tier (5000 VUs/iterations); requires AYB_LOAD_UNSAFE=1
+	@bash -lc '$(call LOAD_REQUIRE_UNSAFE_LOCAL_TIER,load-realtime-ws-5000-local) $(LOAD_BOOTSTRAP_FUNCTIONS); load_export_env; load_export_auth_env; load_export_admin_password_env; export AYB_START_COMMAND="$${AYB_START_COMMAND:-$(LOAD_LOCAL_AYB_START_COMMAND)}"; bash scripts/run-with-ayb.sh "K6_VUS=5000 K6_ITERATIONS=5000 $(MAKE) load-realtime-ws"'
+
 load-realtime-ws-10000: ## Run direct realtime websocket scenario at 10000 VUs/iterations
 	@K6_VUS=10000 K6_ITERATIONS=10000 $(MAKE) load-realtime-ws
+
+load-realtime-ws-10000-local: ## DANGEROUS local realtime websocket load tier (10000 VUs/iterations); requires AYB_LOAD_UNSAFE=1
+	@bash -lc '$(call LOAD_REQUIRE_UNSAFE_LOCAL_TIER,load-realtime-ws-10000-local) $(LOAD_BOOTSTRAP_FUNCTIONS); load_export_env; load_export_auth_env; load_export_admin_password_env; export AYB_START_COMMAND="$${AYB_START_COMMAND:-$(LOAD_LOCAL_AYB_START_COMMAND)}"; bash scripts/run-with-ayb.sh "K6_VUS=10000 K6_ITERATIONS=10000 $(MAKE) load-realtime-ws"'
 
 load-sustained-soak: ## Run direct k6 sustained mixed-workload soak scenario against AYB_BASE_URL
 	@bash -lc '$(LOAD_BOOTSTRAP_FUNCTIONS); load_export_env; load_export_auth_env; load_resolve_admin_token; $(LOAD_SUSTAINED_SOAK_K6_COMMAND)'
 
 load-sustained-soak-local: ## Start local AYB with run-with-ayb and run the sustained mixed-workload soak scenario
-	@bash -lc '$(LOAD_BOOTSTRAP_FUNCTIONS); export -f load_resolve_admin_token; load_export_env; load_export_auth_env; bash scripts/run-with-ayb.sh "load_resolve_admin_token; $(LOAD_SUSTAINED_SOAK_K6_COMMAND)"'
+	@bash -lc '$(LOAD_BOOTSTRAP_FUNCTIONS); export -f load_base_url_is_loopback load_exchange_admin_password_for_token load_resolve_admin_token; load_export_env; load_export_auth_env; load_export_admin_password_env; bash scripts/run-with-ayb.sh "load_resolve_admin_token && $(LOAD_SUSTAINED_SOAK_K6_COMMAND)"'
 
 test-all: test test-integration test-sdk test-ui ## Run all fast tests: Go unit + integration + SDK + UI components
 
@@ -200,13 +295,11 @@ test-full: test-all test-e2e ## Run every automated test: unit + integration + S
 test-demo-e2e: build ## Run demo app E2E tests — Playwright suites for kanban + live-polls (starts demo, runs tests, stops)
 	@cd _dev/manual_smoke_tests && AYB_BIN=$(CURDIR)/ayb bash 18_demo_e2e.test.sh
 
-test-api-smoke: build ## Run API smoke tests against a live server (starts server, runs tests 5-16, stops server)
-	@echo "Starting server for API smoke tests..."
-	@./ayb start; \
-	cd _dev/manual_smoke_tests && ./run_all_tests.sh; \
-	RESULT=$$?; \
-	../../ayb stop 2>/dev/null || true; \
-	exit $$RESULT
+test-api-journey: build ## Run full_journey API smoke lifecycle via run-with-ayb
+	@AYB_STORAGE_ENABLED=true bash scripts/run-with-ayb.sh 'cd _dev/manual_smoke_tests && python3 full_journey.test.py'
+
+test-api-smoke: build ## Run API smoke suite via run-with-ayb (starts server, runs run_all_tests.sh, stops server)
+	@AYB_STORAGE_ENABLED=true bash scripts/run-with-ayb.sh 'cd _dev/manual_smoke_tests && ./run_all_tests.sh'
 
 test-everything: build ## Run absolutely everything: unit + integration + SDK + UI + browser + API smoke tests
 	@failed=""; passed=""; \
@@ -221,10 +314,11 @@ test-everything: build ## Run absolutely everything: unit + integration + SDK + 
 	run_step "Go unit tests"      "go tool gotestsum --format testdox -- -count=1 ./..."; \
 	run_step "Integration tests"  "bash scripts/run-integration-tests.sh"; \
 	run_step "SDK tests"          "cd sdk && npm test"; \
+	run_step "All SDK tests"      "$(MAKE) test-sdk-all"; \
 	run_step "UI component tests" "cd ui && pnpm test"; \
-	run_step "Playwright e2e"     "bash scripts/run-with-ayb.sh 'cd ui && npm run test:browser'"; \
+	run_step "Playwright e2e"     "$(MAKE) test-e2e"; \
 	run_step "Demo app E2E"       "cd _dev/manual_smoke_tests && AYB_BIN=$(CURDIR)/ayb bash 18_demo_e2e.test.sh"; \
-	run_step "API smoke tests"    "./ayb start; cd _dev/manual_smoke_tests && ./run_all_tests.sh; R=\$$?; cd ../.. && ./ayb stop 2>/dev/null || true; exit \$$R"; \
+	run_step "API smoke tests"    "$(MAKE) test-api-smoke"; \
 	printf "\n\033[1m━━━━━━━━━━━━━━━━━━━━━━\033[0m\n"; \
 	printf "\033[1m  TEST SUMMARY\033[0m\n"; \
 	printf "\033[1m━━━━━━━━━━━━━━━━━━━━━━\033[0m\n"; \

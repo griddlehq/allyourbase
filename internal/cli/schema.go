@@ -201,106 +201,139 @@ func listTables(tables map[string]schemaTable, outFmt string) error {
 
 // showTableDetail displays comprehensive information for a single table, performing a case-insensitive lookup by exact key, public schema prefix, or unqualified name. It outputs columns with types and constraints, foreign keys with referenced tables, and indexes, supporting text, CSV, and JSON formats.
 func showTableDetail(name string, tables map[string]schemaTable, outFmt string) error {
-	// Find the table — try exact key first, then unqualified name.
-	var found *schemaTable
-	if t, ok := tables[name]; ok {
-		found = &t
-	} else if t, ok := tables["public."+name]; ok {
-		found = &t
-	} else {
-		for _, t := range tables {
-			if t.Name == name {
-				tt := t
-				found = &tt
-				break
-			}
-		}
-	}
-
-	if found == nil {
-		return fmt.Errorf("table %q not found", name)
+	found, err := findSchemaTable(name, tables)
+	if err != nil {
+		return err
 	}
 
 	if outFmt == "json" {
-		out, _ := json.MarshalIndent(found, "", "  ")
-		os.Stdout.Write(out)
-		fmt.Println()
-		return nil
+		return writeTableDetailJSON(found)
 	}
 
 	if outFmt == "csv" {
-		cols := []string{"Name", "Type", "Nullable", "Default", "PK"}
-		rows := make([][]string, len(found.Columns))
-		for i, col := range found.Columns {
-			nullable := ""
-			if col.Nullable {
-				nullable = "YES"
-			}
-			pk := ""
-			if col.IsPrimaryKey {
-				pk = "PK"
-			}
-			rows[i] = []string{col.Name, col.Type, nullable, col.Default, pk}
-		}
-		return writeCSVStdout(cols, rows)
+		return writeTableDetailCSV(found)
 	}
 
-	// Header
 	fmt.Printf("%s.%s (%s)\n", found.Schema, found.Name, found.Kind)
 	if found.Comment != "" {
 		fmt.Printf("  %s\n", found.Comment)
 	}
 	fmt.Println()
 
-	// Columns
 	fmt.Println("Columns:")
+	printTableColumns(found)
+	printTableForeignKeys(found)
+	printTableIndexes(found)
+	return nil
+}
+
+func findSchemaTable(name string, tables map[string]schemaTable) (*schemaTable, error) {
+	if t, ok := tables[name]; ok {
+		return &t, nil
+	}
+	if t, ok := tables["public."+name]; ok {
+		return &t, nil
+	}
+	for _, t := range tables {
+		if t.Name == name {
+			tt := t
+			return &tt, nil
+		}
+	}
+	return nil, fmt.Errorf("table %q not found", name)
+}
+
+func writeTableDetailJSON(found *schemaTable) error {
+	out, _ := json.MarshalIndent(found, "", "  ")
+	os.Stdout.Write(out)
+	fmt.Println()
+	return nil
+}
+
+func writeTableDetailCSV(found *schemaTable) error {
+	cols := []string{"Name", "Type", "Nullable", "Default", "PK"}
+	rows := make([][]string, len(found.Columns))
+	for i, col := range found.Columns {
+		rows[i] = []string{
+			col.Name,
+			col.Type,
+			columnNullableValue(col),
+			col.Default,
+			columnPKValue(col),
+		}
+	}
+	return writeCSVStdout(cols, rows)
+}
+
+func printTableColumns(found *schemaTable) {
 	w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
 	fmt.Fprintln(w, "  Name\tType\tNullable\tDefault\tPK")
 	fmt.Fprintln(w, "  ---\t---\t---\t---\t---")
 	for _, col := range found.Columns {
-		nullable := ""
-		if col.Nullable {
-			nullable = "YES"
-		}
-		pk := ""
-		if col.IsPrimaryKey {
-			pk = "PK"
-		}
-		def := col.Default
-		if len(def) > 30 {
-			def = def[:27] + "..."
-		}
-		fmt.Fprintf(w, "  %s\t%s\t%s\t%s\t%s\n", col.Name, col.Type, nullable, def, pk)
+		fmt.Fprintf(w, "  %s\t%s\t%s\t%s\t%s\n",
+			col.Name,
+			col.Type,
+			columnNullableValue(col),
+			truncateSchemaDefault(col.Default),
+			columnPKValue(col),
+		)
 	}
 	w.Flush()
+}
 
-	// Foreign keys
-	if len(found.ForeignKeys) > 0 {
-		fmt.Println("\nForeign Keys:")
-		for _, fk := range found.ForeignKeys {
-			fmt.Printf("  %s: (%s) → %s.%s(%s)\n",
-				fk.ConstraintName,
-				strings.Join(fk.Columns, ", "),
-				fk.ReferencedSchema,
-				fk.ReferencedTable,
-				strings.Join(fk.ReferencedColumns, ", "),
-			)
-		}
+func printTableForeignKeys(found *schemaTable) {
+	if len(found.ForeignKeys) == 0 {
+		return
 	}
-
-	// Indexes
-	if len(found.Indexes) > 0 {
-		fmt.Println("\nIndexes:")
-		for _, idx := range found.Indexes {
-			flags := ""
-			if idx.IsPrimary {
-				flags = " [PRIMARY]"
-			} else if idx.IsUnique {
-				flags = " [UNIQUE]"
-			}
-			fmt.Printf("  %s (%s)%s\n", idx.Name, idx.Method, flags)
-		}
+	fmt.Println("\nForeign Keys:")
+	for _, fk := range found.ForeignKeys {
+		fmt.Printf("  %s: (%s) → %s.%s(%s)\n",
+			fk.ConstraintName,
+			strings.Join(fk.Columns, ", "),
+			fk.ReferencedSchema,
+			fk.ReferencedTable,
+			strings.Join(fk.ReferencedColumns, ", "),
+		)
 	}
+}
 
-	return nil
+func printTableIndexes(found *schemaTable) {
+	if len(found.Indexes) == 0 {
+		return
+	}
+	fmt.Println("\nIndexes:")
+	for _, idx := range found.Indexes {
+		fmt.Printf("  %s (%s)%s\n", idx.Name, idx.Method, schemaIndexFlags(idx))
+	}
+}
+
+func columnNullableValue(col schemaColumn) string {
+	if col.Nullable {
+		return "YES"
+	}
+	return ""
+}
+
+func columnPKValue(col schemaColumn) string {
+	if col.IsPrimaryKey {
+		return "PK"
+	}
+	return ""
+}
+
+func truncateSchemaDefault(def string) string {
+	if len(def) > 30 {
+		return def[:27] + "..."
+	}
+	return def
+}
+
+func schemaIndexFlags(idx schemaIndex) string {
+	if idx.IsPrimary {
+		return " [PRIMARY]"
+	}
+	if idx.IsUnique {
+		return " [UNIQUE]"
+	}
+	return ""
 }

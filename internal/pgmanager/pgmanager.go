@@ -58,8 +58,6 @@ func New(cfg Config) *Manager {
 	}
 }
 
-// Start downloads PG binaries (on first run), initializes the data directory,
-// starts the PostgreSQL child process, and returns a connection URL.
 func (m *Manager) Start(ctx context.Context) (string, error) {
 	if m.running {
 		return m.connURL, nil
@@ -71,38 +69,9 @@ func (m *Manager) Start(ctx context.Context) (string, error) {
 		return "", fmt.Errorf("resolving ayb home: %w", err)
 	}
 
-	m.dataDir = m.cfg.DataDir
-	if m.dataDir == "" {
-		m.dataDir = filepath.Join(home, "data")
-	}
-	m.runtimeDir = m.cfg.RuntimeDir
-	if m.runtimeDir == "" {
-		m.runtimeDir = filepath.Join(home, "run")
-	}
-	m.cacheDir = m.cfg.BinCacheDir
-	if m.cacheDir == "" {
-		m.cacheDir = filepath.Join(home, "pg")
-	}
-	m.binDir = m.cfg.BinDir
-	if m.binDir == "" {
-		m.binDir = filepath.Join(home, "pgbin")
-	}
-
-	port := m.cfg.Port
-	if port == 0 {
-		port = 15432
-	}
-
-	pgVersion := m.cfg.PGVersion
-	if pgVersion == "" {
-		pgVersion = "16"
-	}
-
-	// Ensure directories exist.
-	for _, dir := range []string{m.dataDir, m.runtimeDir, m.cacheDir, m.binDir} {
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			return "", fmt.Errorf("creating directory %s: %w", dir, err)
-		}
+	port, pgVersion, err := m.prepareStartLayout(home)
+	if err != nil {
+		return "", err
 	}
 
 	// Check for orphaned process.
@@ -176,6 +145,40 @@ func (m *Manager) Start(ctx context.Context) (string, error) {
 		"data", m.dataDir,
 	)
 	return m.connURL, nil
+}
+
+func (m *Manager) prepareStartLayout(home string) (uint32, string, error) {
+	m.dataDir = defaultManagedPath(m.cfg.DataDir, home, "data")
+	m.runtimeDir = defaultManagedPath(m.cfg.RuntimeDir, home, "run")
+	m.cacheDir = defaultManagedPath(m.cfg.BinCacheDir, home, "pg")
+	m.binDir = defaultManagedPath(m.cfg.BinDir, home, "pgbin")
+	for _, dir := range []string{m.dataDir, m.runtimeDir, m.cacheDir, m.binDir} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return 0, "", fmt.Errorf("creating directory %s: %w", dir, err)
+		}
+	}
+	return defaultManagedPort(m.cfg.Port), defaultManagedPGVersion(m.cfg.PGVersion), nil
+}
+
+func defaultManagedPath(configured, home, suffix string) string {
+	if configured != "" {
+		return configured
+	}
+	return filepath.Join(home, suffix)
+}
+
+func defaultManagedPort(port uint32) uint32 {
+	if port == 0 {
+		return 15432
+	}
+	return port
+}
+
+func defaultManagedPGVersion(version string) string {
+	if version == "" {
+		return "16"
+	}
+	return version
 }
 
 // Stop gracefully shuts down the managed PostgreSQL child process.

@@ -1,4 +1,3 @@
-// Package auth provides user registration, authentication, JWT token management, password reset, email verification, OAuth integration, and multi-factor authentication.
 package auth
 
 import (
@@ -33,23 +32,52 @@ var (
 
 // argon2id parameters. Vars (not consts) so tests can lower them for speed.
 var (
-	argonMemory  uint32 = 64 * 1024 // 64 MiB
-	argonTime    uint32 = 3
-	argonThreads uint8  = 2
+	argonMemory   uint32 = 64 * 1024 // 64 MiB
+	argonTime     uint32 = 3
+	argonThreads  uint8  = 2
+	argonConfigMu sync.RWMutex
 )
 
 const (
-	argonSaltLen = 16
-	argonKeyLen  = 32
+	argonSaltLen      = 16
+	argonKeyLen       = 32
+	argonMinMemoryKiB = 1024
+	argonMinTime      = 1
+	argonMinThreads   = 1
+	argonMaxThreads   = 255
 )
 
-// Service handles user registration, login, and JWT operations.
-// Service handles user authentication operations including registration, login, password reset, email verification, OAuth flows, and multi-factor authentication. It manages JWT token generation and validation, session lifecycle, and integrates with optional email and SMS providers for delivering authentication messages.
+// ConfigureArgon2 sets process-wide argon2id hashing parameters used by auth password hashing.
+func ConfigureArgon2(memory int, time int, threads int) error {
+	if memory < argonMinMemoryKiB {
+		return fmt.Errorf("argon2 memory must be at least %d KiB, got %d", argonMinMemoryKiB, memory)
+	}
+	if time < argonMinTime {
+		return fmt.Errorf("argon2 time must be at least %d, got %d", argonMinTime, time)
+	}
+	if threads < argonMinThreads || threads > argonMaxThreads {
+		return fmt.Errorf("argon2 threads must be between %d and %d, got %d", argonMinThreads, argonMaxThreads, threads)
+	}
+	argonConfigMu.Lock()
+	defer argonConfigMu.Unlock()
+	argonMemory = uint32(memory)
+	argonTime = uint32(time)
+	argonThreads = uint8(threads)
+	return nil
+}
+
+func currentArgon2Config() (memory uint32, time uint32, threads uint8) {
+	argonConfigMu.RLock()
+	defer argonConfigMu.RUnlock()
+	return argonMemory, argonTime, argonThreads
+}
+
 type Service struct {
 	pool                  *pgxpool.Pool
 	jwtSecret             []byte
 	jwtSecretMu           sync.RWMutex
 	tokenDur              time.Duration
+	now                   func() time.Time
 	refreshDur            time.Duration
 	minPwLen              int // minimum password length (default 8)
 	logger                *slog.Logger
@@ -199,4 +227,12 @@ func (s *Service) UserByID(ctx context.Context, id string) (*User, error) {
 // DB returns the database pool (needed by integration tests).
 func (s *Service) DB() *pgxpool.Pool {
 	return s.pool
+}
+
+// nowTime returns the service clock used by JWT issue/validation paths.
+func (s *Service) nowTime() time.Time {
+	if s != nil && s.now != nil {
+		return s.now()
+	}
+	return time.Now()
 }

@@ -1,14 +1,21 @@
-// Package config Provides validation functions for authentication configuration including basic auth, OAuth, OIDC, SMS, SAML, and OAuth provider mode settings.
 package config
 
 import (
 	"fmt"
 )
 
-// validateAuthConfig validates core authentication settings including minimum password length, rate limits, API size limits, and JWT secret configuration.
 func validateAuthConfig(c *Config) error {
 	if c.Auth.MinPasswordLength < 1 {
 		return fmt.Errorf("auth.min_password_length must be at least 1, got %d", c.Auth.MinPasswordLength)
+	}
+	if c.Auth.Argon2Memory < 1024 {
+		return fmt.Errorf("auth.argon2_memory must be at least 1024, got %d", c.Auth.Argon2Memory)
+	}
+	if c.Auth.Argon2Time < 1 {
+		return fmt.Errorf("auth.argon2_time must be at least 1, got %d", c.Auth.Argon2Time)
+	}
+	if c.Auth.Argon2Threads < 1 || c.Auth.Argon2Threads > 255 {
+		return fmt.Errorf("auth.argon2_threads must be between 1 and 255, got %d", c.Auth.Argon2Threads)
 	}
 	if _, _, err := ParseRateLimitSpec(c.Auth.RateLimitAuth); err != nil {
 		return fmt.Errorf("auth.rate_limit_auth: %w", err)

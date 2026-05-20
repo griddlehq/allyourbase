@@ -2,239 +2,15 @@
 package server
 
 import (
-	"context"
-	"fmt"
-	"io"
 	"log/slog"
-	"mime"
-	"net"
 	"net/http"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/allyourbase/ayb/internal/auth"
 	"github.com/allyourbase/ayb/internal/httputil"
-	"github.com/allyourbase/ayb/internal/logging"
-	"github.com/allyourbase/ayb/internal/observability"
-	"github.com/allyourbase/ayb/ui"
-	"github.com/go-chi/chi/v5/middleware"
 )
-
-// requestLogger returns middleware that logs each request as structured JSON.
-func requestLogger(loggerProvider func() *slog.Logger) func(http.Handler) http.Handler {
-	return func(next http.Handler) http.Handler {
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			logger := loggerProvider()
-			if logger == nil {
-				next.ServeHTTP(w, r)
-				return
-			}
-
-			start := time.Now()
-			ww := middleware.NewWrapResponseWriter(w, r.ProtoMajor)
-
-			defer func() {
-				status := ww.Status()
-				if status == 0 {
-					status = http.StatusOK
-				}
-				fields := []any{
-					"method", r.Method,
-					"path", r.URL.Path,
-					"status", status,
-					"duration_ms", time.Since(start).Milliseconds(),
-					"bytes", ww.BytesWritten(),
-					"request_id", middleware.GetReqID(r.Context()),
-					"remote", r.RemoteAddr,
-				}
-				// Include tenant_id in logs when tenant context or request tenant source is present.
-				if tenantID := tenantIDFromContextOrRequest(r); tenantID != "" {
-					fields = append(fields, "tenant_id", tenantID)
-				}
-				for k, v := range observability.TraceLogFields(r.Context()) {
-					fields = append(fields, k, v)
-				}
-				logger.Info("request", fields...)
-			}()
-
-			next.ServeHTTP(ww, r)
-		})
-	}
-}
-
-// wrapLoggerForDrainFanout returns a logger that sends every record to the log drain manager,
-// while preserving the existing handler behavior.
-func wrapLoggerForDrainFanout(base *slog.Logger, manager *logging.DrainManager) *slog.Logger {
-	if base == nil || manager == nil {
-		return base
-	}
-	return slog.New(&drainSlogHandler{next: base.Handler(), drainManager: manager})
-}
-
-// drainSlogHandler forwards slog records to an external drain manager.
-type drainSlogHandler struct {
-	next         slog.Handler
-	drainManager *logging.DrainManager
-	preAttrs     []slog.Attr
-	groupPrefix  string
-}
-
-func (h *drainSlogHandler) Enabled(ctx context.Context, level slog.Level) bool {
-	return h.next.Enabled(ctx, level)
-}
-
-// Handle collects attributes from the slog record, applies group prefix namespacing, enqueues the resulting entry to the drain manager, and forwards the record to the next handler in the chain.
-func (h *drainSlogHandler) Handle(ctx context.Context, record slog.Record) error {
-	fields := make(map[string]any)
-	// Include pre-set attrs from WithAttrs calls (e.g. slog.With("component", "auth")).
-	for _, a := range h.preAttrs {
-		key := a.Key
-		if h.groupPrefix != "" {
-			key = h.groupPrefix + "." + key
-		}
-		fields[key] = a.Value.Resolve().Any()
-	}
-	record.Attrs(func(a slog.Attr) bool {
-		key := a.Key
-		if h.groupPrefix != "" {
-			key = h.groupPrefix + "." + key
-		}
-		fields[key] = a.Value.Resolve().Any()
-		return true
-	})
-
-	h.drainManager.Enqueue(logging.LogEntry{
-		Timestamp: record.Time,
-		Level:     strings.ToLower(record.Level.String()),
-		Message:   record.Message,
-		Source:    "app",
-		Fields:    fields,
-	})
-
-	return h.next.Handle(ctx, record)
-}
-
-func (h *drainSlogHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
-	combined := make([]slog.Attr, len(h.preAttrs)+len(attrs))
-	copy(combined, h.preAttrs)
-	copy(combined[len(h.preAttrs):], attrs)
-	return &drainSlogHandler{
-		next:         h.next.WithAttrs(attrs),
-		drainManager: h.drainManager,
-		preAttrs:     combined,
-		groupPrefix:  h.groupPrefix,
-	}
-}
-
-func (h *drainSlogHandler) WithGroup(name string) slog.Handler {
-	prefix := name
-	if h.groupPrefix != "" {
-		prefix = h.groupPrefix + "." + name
-	}
-	return &drainSlogHandler{
-		next:         h.next.WithGroup(name),
-		drainManager: h.drainManager,
-		preAttrs:     h.preAttrs,
-		groupPrefix:  prefix,
-	}
-}
-
-// staticSPAHandler serves the embedded admin SPA with index.html fallback
-// for client-side routing support. Files are served directly from the
-// embedded FS to avoid http.FileServer's index.html redirect behavior.
-func staticSPAHandler(adminPath string) http.HandlerFunc {
-	adminPath = normalizedAdminPath(adminPath)
-	return func(w http.ResponseWriter, r *http.Request) {
-		path := strings.TrimPrefix(r.URL.Path, adminPath)
-		path = strings.TrimPrefix(path, "/")
-
-		// Explicit index requests should get rewritten SPA HTML.
-		if path == "" || path == "index.html" {
-			serveEmbeddedIndexHTML(w, adminPath)
-			return
-		}
-
-		// Try exact file; fall back to index.html for SPA routing.
-		if !serveEmbeddedFile(w, path, false) {
-			serveEmbeddedIndexHTML(w, adminPath)
-		}
-	}
-}
-
-// serveEmbeddedFile writes a file from the embedded UI FS to w.
-// Returns false if the file doesn't exist (caller should fall back).
-func serveEmbeddedFile(w http.ResponseWriter, path string, mustExist bool) bool {
-	f, err := ui.DistDirFS.Open(path)
-	if err != nil {
-		if mustExist {
-			http.Error(w, "not found", http.StatusNotFound)
-		}
-		return false
-	}
-	defer f.Close()
-
-	info, err := f.Stat()
-	if err != nil || info.IsDir() {
-		if mustExist {
-			http.Error(w, "not found", http.StatusNotFound)
-		}
-		return false
-	}
-
-	// Cache static assets (not index.html).
-	if path != "index.html" {
-		w.Header().Set("Cache-Control", "public, max-age=1209600")
-	}
-	ct := mime.TypeByExtension(filepath.Ext(path))
-	if ct != "" {
-		w.Header().Set("Content-Type", ct)
-	}
-	w.WriteHeader(http.StatusOK)
-	io.Copy(w, f)
-	return true
-}
-
-// serveEmbeddedIndexHTML reads the embedded index.html file, rewrites its paths with rewriteAdminIndexHTML, and writes the result to w with appropriate HTTP headers.
-func serveEmbeddedIndexHTML(w http.ResponseWriter, adminPath string) {
-	f, err := ui.DistDirFS.Open("index.html")
-	if err != nil {
-		http.Error(w, "not found", http.StatusNotFound)
-		return
-	}
-	defer f.Close()
-
-	raw, err := io.ReadAll(f)
-	if err != nil {
-		http.Error(w, "not found", http.StatusNotFound)
-		return
-	}
-
-	if ct := mime.TypeByExtension(".html"); ct != "" {
-		w.Header().Set("Content-Type", ct)
-	}
-	w.WriteHeader(http.StatusOK)
-	io.WriteString(w, rewriteAdminIndexHTML(string(raw), adminPath))
-}
-
-// rewriteAdminIndexHTML modifies HTML by rewriting relative asset and admin paths to be prefixed with adminPath, enabling the embedded SPA to serve correctly from a non-root URL.
-func rewriteAdminIndexHTML(html string, adminPath string) string {
-	adminBase := adminPathWithTrailingSlash(adminPath)
-	replacer := strings.NewReplacer(
-		`="/assets/`, `="`+adminBase+`assets/`,
-		`='/assets/`, `='`+adminBase+`assets/`,
-		`="/admin/`, `="`+adminBase,
-		`='/admin/`, `='`+adminBase,
-		`url(/assets/`, `url(`+adminBase+`assets/`,
-		`url('/assets/`, `url('`+adminBase+`assets/`,
-		`url("/assets/`, `url("`+adminBase+`assets/`,
-		`url(/admin/`, `url(`+adminBase,
-		`url('/admin/`, `url('`+adminBase,
-		`url("/admin/`, `url("`+adminBase,
-	)
-	return replacer.Replace(html)
-}
 
 // corsMiddleware returns middleware that sets CORS headers.
 // Per the spec, Access-Control-Allow-Origin must be either "*" or a single
@@ -284,103 +60,17 @@ func securityHeaders(next http.Handler) http.Handler {
 		w.Header().Set("X-Content-Type-Options", "nosniff")
 		w.Header().Set("X-Frame-Options", "DENY")
 		w.Header().Set("Referrer-Policy", "strict-origin-when-cross-origin")
+		w.Header().Set("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+		w.Header().Set("X-Permitted-Cross-Domain-Policies", "none")
+
+		// HSTS: only advertise when the request arrived over TLS (direct or
+		// via a trusted reverse proxy that sets X-Forwarded-Proto).
+		if r.TLS != nil || r.Header.Get("X-Forwarded-Proto") == "https" {
+			w.Header().Set("Strict-Transport-Security", "max-age=63072000; includeSubDomains")
+		}
+
 		next.ServeHTTP(w, r)
 	})
-}
-
-// requestLogMiddleware records each request as a RequestLogEntry via the async RequestLogger.
-func requestLogMiddleware(rl *RequestLogger, drainManagerProvider func() *logging.DrainManager) func(http.Handler) http.Handler {
-	return func(next http.Handler) http.Handler {
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			start := time.Now()
-			ww := middleware.NewWrapResponseWriter(w, r.ProtoMajor)
-			next.ServeHTTP(ww, r)
-
-			status := ww.Status()
-			if status == 0 {
-				status = http.StatusOK
-			}
-
-			entry := RequestLogEntry{
-				Method:       r.Method,
-				Path:         r.URL.Path,
-				StatusCode:   status,
-				DurationMS:   time.Since(start).Milliseconds(),
-				RequestSize:  normalizedRequestSize(r.ContentLength),
-				ResponseSize: int64(ww.BytesWritten()),
-				RequestID:    middleware.GetReqID(r.Context()),
-			}
-
-			if host, _, err := net.SplitHostPort(r.RemoteAddr); err == nil {
-				entry.IPAddress = host
-			} else {
-				entry.IPAddress = r.RemoteAddr
-			}
-
-			if claims := auth.ClaimsFromContext(r.Context()); claims != nil {
-				entry.UserID = claims.Subject
-				entry.APIKeyID = claims.APIKeyID
-			}
-
-			// Include tenant_id in request logs when tenant context or request tenant source is present.
-			if tenantID := tenantIDFromContextOrRequest(r); tenantID != "" {
-				entry.TenantID = tenantID
-			}
-
-			if rl != nil {
-				rl.Log(entry)
-			}
-			if dm := drainManagerProvider(); dm != nil {
-				drainEntry := logEntryToDrain(entry)
-				for k, v := range observability.TraceLogFields(r.Context()) {
-					drainEntry.Fields[k] = v
-				}
-				dm.Enqueue(drainEntry)
-			}
-		})
-	}
-}
-
-func normalizedRequestSize(contentLength int64) int64 {
-	if contentLength < 0 {
-		return 0
-	}
-	return contentLength
-}
-
-// logEntryToDrain converts a RequestLogEntry to a logging.LogEntry, mapping HTTP request metadata and excluding empty optional fields.
-func logEntryToDrain(entry RequestLogEntry) logging.LogEntry {
-	fields := map[string]any{
-		"method":        entry.Method,
-		"path":          entry.Path,
-		"status":        entry.StatusCode,
-		"duration_ms":   entry.DurationMS,
-		"request_size":  entry.RequestSize,
-		"response_size": entry.ResponseSize,
-	}
-	if entry.UserID != "" {
-		fields["user_id"] = entry.UserID
-	}
-	if entry.APIKeyID != "" {
-		fields["api_key_id"] = entry.APIKeyID
-	}
-	if entry.RequestID != "" {
-		fields["request_id"] = entry.RequestID
-	}
-	if entry.IPAddress != "" {
-		fields["ip_address"] = entry.IPAddress
-	}
-	if entry.TenantID != "" {
-		fields["tenant_id"] = entry.TenantID
-	}
-
-	return logging.LogEntry{
-		Timestamp: time.Now().UTC(),
-		Level:     "info",
-		Message:   fmt.Sprintf("%s %s", entry.Method, entry.Path),
-		Source:    "request",
-		Fields:    fields,
-	}
 }
 
 // --- Rate limiting and IP allowlist middleware ---
@@ -498,7 +188,7 @@ func APIRouteRateLimitMiddleware(authenticated, anonymous *auth.RateLimiter, aut
 	}
 }
 
-// TODO: Document handleRateLimitDecision.
+// handleRateLimitDecision sets X-RateLimit response headers and, if the request is not allowed, writes a 429 response with a Retry-After header and returns false.
 func handleRateLimitDecision(w http.ResponseWriter, limit int, allowed bool, remaining int, resetTime time.Time) bool {
 	w.Header().Set("X-RateLimit-Limit", strconv.Itoa(limit))
 	w.Header().Set("X-RateLimit-Remaining", strconv.Itoa(remaining))

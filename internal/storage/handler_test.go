@@ -297,6 +297,318 @@ func TestHandleUpload_FastUploadNotAffectedByTimeout(t *testing.T) {
 	testutil.Equal(t, int64(len("fast-image")), resp.Size)
 }
 
+func TestHandleResumableCreateRollsBackReservedQuotaWhenCreateFails(t *testing.T) {
+	t.Parallel()
+
+	h := NewHandler(newTestService(), testutil.DiscardLogger(), 10<<20, "")
+
+	reserveCalls := 0
+	createCalls := 0
+	rollbackCalls := 0
+	const reservedBytes = int64(123)
+	const userID = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+
+	h.mutations.reserveQuota = func(_ context.Context, gotUserID string, gotBytes int64) error {
+		reserveCalls++
+		testutil.Equal(t, userID, gotUserID)
+		testutil.Equal(t, reservedBytes, gotBytes)
+		return nil
+	}
+	h.mutations.createResumableUpload = func(_ context.Context, bucket, name, contentType string, gotUserID *string, totalSize int64) (*ResumableUpload, error) {
+		createCalls++
+		testutil.Equal(t, "images", bucket)
+		testutil.Equal(t, "movie.bin", name)
+		testutil.Equal(t, "application/octet-stream", contentType)
+		testutil.NotNil(t, gotUserID)
+		testutil.Equal(t, userID, *gotUserID)
+		testutil.Equal(t, reservedBytes, totalSize)
+		return nil, ErrInvalidName
+	}
+	h.mutations.decrementUsage = func(_ context.Context, gotUserID string, gotBytes int64) error {
+		rollbackCalls++
+		testutil.Equal(t, userID, gotUserID)
+		testutil.Equal(t, reservedBytes, gotBytes)
+		return nil
+	}
+
+	router := testRouter(h)
+	req := httptest.NewRequest(http.MethodPost, "/api/storage/upload/resumable?bucket=images&name=movie.bin", nil)
+	req.Header.Set(tusResumableHeader, tusResumableVersion)
+	req.Header.Set(tusUploadLengthHeader, strconv.FormatInt(reservedBytes, 10))
+	req = req.WithContext(auth.ContextWithClaims(req.Context(), &auth.Claims{
+		RegisteredClaims: jwt.RegisteredClaims{Subject: userID},
+	}))
+	rec := httptest.NewRecorder()
+
+	router.ServeHTTP(rec, req)
+
+	testutil.Equal(t, http.StatusBadRequest, rec.Code)
+	testutil.Equal(t, 1, reserveCalls)
+	testutil.Equal(t, 1, createCalls)
+	testutil.Equal(t, 1, rollbackCalls)
+}
+
+func TestHandleResumablePatch_RecoversAfterTransientFinalizeFailure(t *testing.T) {
+	t.Parallel()
+
+	h := NewHandler(newTestService(), testutil.DiscardLogger(), 10<<20, "")
+
+	const uploadID = "upload-123"
+	const userID = "quota-user"
+	finalChunk := []byte("chunk-data")
+	upload := &ResumableUpload{
+		ID:           uploadID,
+		Bucket:       "images",
+		Name:         "video.mp4",
+		UploadedSize: int64(len(finalChunk)),
+		TotalSize:    int64(len(finalChunk)),
+	}
+
+	appendCalls := 0
+	h.mutations.appendResumableUpload = func(_ context.Context, id string, offset int64, callerUserID *string, src io.Reader) (*ResumableUpload, bool, error) {
+		appendCalls++
+		testutil.Equal(t, uploadID, id)
+		testutil.Equal(t, int64(0), offset)
+		testutil.NotNil(t, callerUserID)
+		testutil.Equal(t, userID, *callerUserID)
+		body, err := io.ReadAll(src)
+		testutil.NoError(t, err)
+		testutil.Equal(t, string(finalChunk), string(body))
+		return upload, true, nil
+	}
+
+	finalizeCalls := 0
+	h.mutations.finalizeResumableUpload = func(_ context.Context, id string, callerUserID *string) (*Object, error) {
+		finalizeCalls++
+		testutil.Equal(t, uploadID, id)
+		testutil.NotNil(t, callerUserID)
+		testutil.Equal(t, userID, *callerUserID)
+		if finalizeCalls == 1 {
+			return nil, errors.New("backend transient finalize failure")
+		}
+		now := time.Date(2026, 3, 31, 10, 0, 0, 0, time.UTC)
+		return &Object{
+			ID:        "obj-1",
+			Bucket:    "images",
+			Name:      "video.mp4",
+			CreatedAt: now,
+			UpdatedAt: now,
+		}, nil
+	}
+
+	router := testRouter(h)
+
+	// Simulates S3/backend transient write failure during resumable finalize — proves client retry succeeds at HTTP layer.
+	req1 := httptest.NewRequest(http.MethodPatch, "/api/storage/upload/resumable/"+uploadID, bytes.NewReader(finalChunk))
+	req1.Header.Set(tusResumableHeader, tusResumableVersion)
+	req1.Header.Set("Content-Type", tusOffsetContentType)
+	req1.Header.Set(tusUploadOffsetHeader, "0")
+	req1 = withUserClaims(req1, userID)
+	rec1 := httptest.NewRecorder()
+	router.ServeHTTP(rec1, req1)
+
+	testutil.Equal(t, http.StatusInternalServerError, rec1.Code)
+
+	req2 := httptest.NewRequest(http.MethodPatch, "/api/storage/upload/resumable/"+uploadID, bytes.NewReader(finalChunk))
+	req2.Header.Set(tusResumableHeader, tusResumableVersion)
+	req2.Header.Set("Content-Type", tusOffsetContentType)
+	req2.Header.Set(tusUploadOffsetHeader, "0")
+	req2 = withUserClaims(req2, userID)
+	rec2 := httptest.NewRecorder()
+	router.ServeHTTP(rec2, req2)
+
+	testutil.Equal(t, http.StatusNoContent, rec2.Code)
+	testutil.Equal(t, 2, appendCalls)
+	testutil.Equal(t, 2, finalizeCalls)
+}
+
+func TestHandleDeleteReturnsMappedErrorsWhenGetObjectFails(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		mutationErr error
+		wantStatus  int
+		wantBody    struct {
+			Code    int    `json:"code"`
+			Message string `json:"message"`
+		}
+	}{
+		{
+			name:        "not found maps to 404",
+			mutationErr: ErrNotFound,
+			wantStatus:  http.StatusNotFound,
+			wantBody: struct {
+				Code    int    `json:"code"`
+				Message string `json:"message"`
+			}{Code: http.StatusNotFound, Message: "file not found"},
+		},
+		{
+			name:        "permission denied maps to 403",
+			mutationErr: ErrPermissionDenied,
+			wantStatus:  http.StatusForbidden,
+			wantBody: struct {
+				Code    int    `json:"code"`
+				Message string `json:"message"`
+			}{Code: http.StatusForbidden, Message: "insufficient storage permissions"},
+		},
+		{
+			name:        "generic error maps to 500",
+			mutationErr: errors.New("backend temporarily unavailable"),
+			wantStatus:  http.StatusInternalServerError,
+			wantBody: struct {
+				Code    int    `json:"code"`
+				Message string `json:"message"`
+			}{Code: http.StatusInternalServerError, Message: "internal error"},
+		},
+	}
+
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			h := NewHandler(newTestService(), testutil.DiscardLogger(), 10<<20, "")
+			h.mutations.getObject = func(_ context.Context, bucket, name string) (*Object, error) {
+				testutil.Equal(t, "private-bucket", bucket)
+				testutil.Equal(t, "folder/file.txt", name)
+				return nil, tc.mutationErr
+			}
+			router := testRouter(h)
+			req := httptest.NewRequest(http.MethodDelete, "/api/storage/private-bucket/folder/file.txt", nil)
+			rec := httptest.NewRecorder()
+
+			router.ServeHTTP(rec, req)
+
+			testutil.Equal(t, tc.wantStatus, rec.Code)
+			testutil.Equal(t, "application/json", rec.Header().Get("Content-Type"))
+
+			var errResp struct {
+				Code    int    `json:"code"`
+				Message string `json:"message"`
+			}
+			testutil.NoError(t, json.NewDecoder(rec.Body).Decode(&errResp))
+			testutil.Equal(t, tc.wantBody.Code, errResp.Code)
+			testutil.Equal(t, tc.wantBody.Message, errResp.Message)
+		})
+	}
+}
+
+func TestHandleDeleteReturnsMappedErrorsWhenDeleteFails(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		mutationErr error
+		wantStatus  int
+		wantBody    struct {
+			Code    int    `json:"code"`
+			Message string `json:"message"`
+		}
+	}{
+		{
+			name:        "not found maps to 404",
+			mutationErr: ErrNotFound,
+			wantStatus:  http.StatusNotFound,
+			wantBody: struct {
+				Code    int    `json:"code"`
+				Message string `json:"message"`
+			}{Code: http.StatusNotFound, Message: "file not found"},
+		},
+		{
+			name:        "permission denied maps to 403",
+			mutationErr: ErrPermissionDenied,
+			wantStatus:  http.StatusForbidden,
+			wantBody: struct {
+				Code    int    `json:"code"`
+				Message string `json:"message"`
+			}{Code: http.StatusForbidden, Message: "insufficient storage permissions"},
+		},
+		{
+			name:        "generic error maps to 500",
+			mutationErr: errors.New("delete mutation failed"),
+			wantStatus:  http.StatusInternalServerError,
+			wantBody: struct {
+				Code    int    `json:"code"`
+				Message string `json:"message"`
+			}{Code: http.StatusInternalServerError, Message: "internal error"},
+		},
+	}
+
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			h := NewHandler(newTestService(), testutil.DiscardLogger(), 10<<20, "")
+			h.mutations.getObject = func(_ context.Context, bucket, name string) (*Object, error) {
+				testutil.Equal(t, "private-bucket", bucket)
+				testutil.Equal(t, "folder/file.txt", name)
+				return &Object{Bucket: bucket, Name: name, Size: 123}, nil
+			}
+			h.mutations.deleteObject = func(_ context.Context, bucket, name string) error {
+				testutil.Equal(t, "private-bucket", bucket)
+				testutil.Equal(t, "folder/file.txt", name)
+				return tc.mutationErr
+			}
+			router := testRouter(h)
+			req := httptest.NewRequest(http.MethodDelete, "/api/storage/private-bucket/folder/file.txt", nil)
+			rec := httptest.NewRecorder()
+
+			router.ServeHTTP(rec, req)
+
+			testutil.Equal(t, tc.wantStatus, rec.Code)
+			testutil.Equal(t, "application/json", rec.Header().Get("Content-Type"))
+
+			var errResp struct {
+				Code    int    `json:"code"`
+				Message string `json:"message"`
+			}
+			testutil.NoError(t, json.NewDecoder(rec.Body).Decode(&errResp))
+			testutil.Equal(t, tc.wantBody.Code, errResp.Code)
+			testutil.Equal(t, tc.wantBody.Message, errResp.Message)
+		})
+	}
+}
+
+func TestHandleDeleteStillReturnsNoContentWhenDecrementUsageFails(t *testing.T) {
+	t.Parallel()
+
+	h := NewHandler(newTestService(), testutil.DiscardLogger(), 10<<20, "")
+	userID := "delete-user"
+	h.mutations.getObject = func(_ context.Context, bucket, name string) (*Object, error) {
+		testutil.Equal(t, "private-bucket", bucket)
+		testutil.Equal(t, "folder/file.txt", name)
+		return &Object{
+			Bucket: bucket,
+			Name:   name,
+			UserID: &userID,
+			Size:   33,
+		}, nil
+	}
+	h.mutations.deleteObject = func(_ context.Context, bucket, name string) error {
+		testutil.Equal(t, "private-bucket", bucket)
+		testutil.Equal(t, "folder/file.txt", name)
+		return nil
+	}
+
+	decrementCalls := 0
+	h.mutations.decrementUsage = func(_ context.Context, gotUserID string, bytes int64) error {
+		decrementCalls++
+		testutil.Equal(t, userID, gotUserID)
+		testutil.Equal(t, int64(33), bytes)
+		return errors.New("usage service unavailable")
+	}
+
+	router := testRouter(h)
+	req := httptest.NewRequest(http.MethodDelete, "/api/storage/private-bucket/folder/file.txt", nil)
+	rec := httptest.NewRecorder()
+	router.ServeHTTP(rec, req)
+
+	testutil.Equal(t, http.StatusNoContent, rec.Code)
+	testutil.Equal(t, 1, decrementCalls)
+}
+
 func TestPublicObjectResponseURLUsesCDN(t *testing.T) {
 	t.Parallel()
 	h := NewHandler(newTestService(), testutil.DiscardLogger(), 10<<20, "https://cdn.example.com")

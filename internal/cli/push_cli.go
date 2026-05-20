@@ -45,10 +45,14 @@ var pushSendCmd = &cobra.Command{
 	RunE:  runPushSend,
 }
 
-var pushListDeliveriesCmd = &cobra.Command{
-	Use:   "list-deliveries",
-	Short: "List push delivery history",
-	RunE:  runPushListDeliveries,
+type pushDeviceListItem struct {
+	ID         string  `json:"id"`
+	UserID     string  `json:"user_id"`
+	Provider   string  `json:"provider"`
+	Platform   string  `json:"platform"`
+	Token      string  `json:"token"`
+	DeviceName *string `json:"device_name"`
+	IsActive   bool    `json:"is_active"`
 }
 
 func init() {
@@ -72,12 +76,6 @@ func init() {
 	pushSendCmd.Flags().String("body", "", "Notification body (required)")
 	pushSendCmd.Flags().String("data", "{}", "JSON map[string]string data payload")
 
-	pushListDeliveriesCmd.Flags().String("app-id", "", "Filter by app ID")
-	pushListDeliveriesCmd.Flags().String("user-id", "", "Filter by user ID")
-	pushListDeliveriesCmd.Flags().String("status", "", "Filter by status (pending|sent|failed|invalid_token)")
-	pushListDeliveriesCmd.Flags().Int("limit", 50, "Maximum results")
-	pushListDeliveriesCmd.Flags().Int("offset", 0, "Offset")
-
 	pushCmd.AddCommand(pushListDevicesCmd)
 	pushCmd.AddCommand(pushRegisterDeviceCmd)
 	pushCmd.AddCommand(pushRevokeDeviceCmd)
@@ -90,9 +88,55 @@ func init() {
 // runPushListDevices lists registered push device tokens, optionally filtering by app-id, user-id, and active status, and outputs results in table, JSON, or CSV format.
 func runPushListDevices(cmd *cobra.Command, _ []string) error {
 	outFmt := outputFormat(cmd)
-	appID, _ := cmd.Flags().GetString("app-id")
-	userID, _ := cmd.Flags().GetString("user-id")
-	includeInactive, _ := cmd.Flags().GetBool("include-inactive")
+	path, err := buildPushListDevicesPath(cmd)
+	if err != nil {
+		return err
+	}
+
+	resp, body, err := adminRequest(cmd, http.MethodGet, path, nil)
+	if err != nil {
+		return err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return serverError(resp.StatusCode, body)
+	}
+
+	items, err := parsePushListDevices(body)
+	if err != nil {
+		return err
+	}
+
+	if outFmt == "json" {
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetIndent("", "  ")
+		return enc.Encode(items)
+	}
+
+	if len(items) == 0 {
+		fmt.Println("No push devices found.")
+		return nil
+	}
+
+	if outFmt == "csv" {
+		return writePushDeviceRowsCSV(items)
+	}
+
+	return writePushDeviceRowsTable(items)
+}
+
+func buildPushListDevicesPath(cmd *cobra.Command) (string, error) {
+	appID, err := cmd.Flags().GetString("app-id")
+	if err != nil {
+		return "", err
+	}
+	userID, err := cmd.Flags().GetString("user-id")
+	if err != nil {
+		return "", err
+	}
+	includeInactive, err := cmd.Flags().GetBool("include-inactive")
+	if err != nil {
+		return "", err
+	}
 
 	q := url.Values{}
 	if appID != "" {
@@ -109,71 +153,42 @@ func runPushListDevices(cmd *cobra.Command, _ []string) error {
 	if encoded := q.Encode(); encoded != "" {
 		path += "?" + encoded
 	}
+	return path, nil
+}
 
-	resp, body, err := adminRequest(cmd, http.MethodGet, path, nil)
-	if err != nil {
-		return err
-	}
-	if resp.StatusCode != http.StatusOK {
-		return serverError(resp.StatusCode, body)
-	}
-
+func parsePushListDevices(body []byte) ([]pushDeviceListItem, error) {
 	var result struct {
-		Items []struct {
-			ID         string  `json:"id"`
-			UserID     string  `json:"user_id"`
-			Provider   string  `json:"provider"`
-			Platform   string  `json:"platform"`
-			Token      string  `json:"token"`
-			DeviceName *string `json:"device_name"`
-			IsActive   bool    `json:"is_active"`
-		} `json:"items"`
+		Items []pushDeviceListItem `json:"items"`
 	}
 	if err := json.Unmarshal(body, &result); err != nil {
-		return fmt.Errorf("parsing response: %w", err)
+		return nil, fmt.Errorf("parsing response: %w", err)
 	}
+	return result.Items, nil
+}
 
-	if outFmt == "json" {
-		enc := json.NewEncoder(os.Stdout)
-		enc.SetIndent("", "  ")
-		return enc.Encode(result.Items)
+func writePushDeviceRowsCSV(items []pushDeviceListItem) error {
+	rows := make([][]string, 0, len(items))
+	for _, item := range items {
+		rows = append(rows, []string{
+			item.ID,
+			item.UserID,
+			item.Provider,
+			item.Platform,
+			fmt.Sprintf("%v", item.IsActive),
+			tokenPreview(item.Token),
+			pushDeviceNameCSV(item.DeviceName),
+		})
 	}
+	return writeCSVStdout(
+		[]string{"ID", "User", "Provider", "Platform", "Active", "Token", "Device"},
+		rows,
+	)
+}
 
-	if len(result.Items) == 0 {
-		fmt.Println("No push devices found.")
-		return nil
-	}
-
-	if outFmt == "csv" {
-		rows := make([][]string, 0, len(result.Items))
-		for _, item := range result.Items {
-			deviceName := ""
-			if item.DeviceName != nil {
-				deviceName = *item.DeviceName
-			}
-			rows = append(rows, []string{
-				item.ID,
-				item.UserID,
-				item.Provider,
-				item.Platform,
-				fmt.Sprintf("%v", item.IsActive),
-				tokenPreview(item.Token),
-				deviceName,
-			})
-		}
-		return writeCSVStdout(
-			[]string{"ID", "User", "Provider", "Platform", "Active", "Token", "Device"},
-			rows,
-		)
-	}
-
+func writePushDeviceRowsTable(items []pushDeviceListItem) error {
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
 	fmt.Fprintln(w, "ID\tUSER\tPROVIDER\tPLATFORM\tACTIVE\tTOKEN\tDEVICE")
-	for _, item := range result.Items {
-		deviceName := "-"
-		if item.DeviceName != nil && *item.DeviceName != "" {
-			deviceName = *item.DeviceName
-		}
+	for _, item := range items {
 		fmt.Fprintf(
 			w,
 			"%s\t%s\t%s\t%s\t%v\t%s\t%s\n",
@@ -183,10 +198,24 @@ func runPushListDevices(cmd *cobra.Command, _ []string) error {
 			item.Platform,
 			item.IsActive,
 			tokenPreview(item.Token),
-			deviceName,
+			pushDeviceNameTable(item.DeviceName),
 		)
 	}
 	return w.Flush()
+}
+
+func pushDeviceNameCSV(name *string) string {
+	if name == nil {
+		return ""
+	}
+	return *name
+}
+
+func pushDeviceNameTable(name *string) string {
+	if name == nil || *name == "" {
+		return "-"
+	}
+	return *name
 }
 
 // runPushRegisterDevice registers a new push device token with required fields app-id, user-id, provider (fcm or apns), platform (ios or android), and device token. It returns the registered device information.
@@ -357,104 +386,6 @@ func runPushSend(cmd *cobra.Command, _ []string) error {
 		fmt.Printf("Push queued: %d deliveries created.\n", len(result.Deliveries))
 	}
 	return nil
-}
-
-// runPushListDeliveries lists push delivery history with optional filtering by app-id, user-id, and status, supporting pagination via limit and offset parameters. Results are output in table, JSON, or CSV format.
-func runPushListDeliveries(cmd *cobra.Command, _ []string) error {
-	outFmt := outputFormat(cmd)
-	appID, _ := cmd.Flags().GetString("app-id")
-	userID, _ := cmd.Flags().GetString("user-id")
-	status, _ := cmd.Flags().GetString("status")
-	limit, _ := cmd.Flags().GetInt("limit")
-	offset, _ := cmd.Flags().GetInt("offset")
-
-	if status != "" {
-		switch status {
-		case push.DeliveryStatusPending, push.DeliveryStatusSent, push.DeliveryStatusFailed, push.DeliveryStatusInvalidToken:
-		default:
-			return fmt.Errorf("--status must be one of: pending, sent, failed, invalid_token")
-		}
-	}
-	if limit <= 0 {
-		return fmt.Errorf("--limit must be greater than 0")
-	}
-	if offset < 0 {
-		return fmt.Errorf("--offset must be greater than or equal to 0")
-	}
-
-	q := url.Values{}
-	if appID != "" {
-		q.Set("app_id", appID)
-	}
-	if userID != "" {
-		q.Set("user_id", userID)
-	}
-	if status != "" {
-		q.Set("status", status)
-	}
-	q.Set("limit", fmt.Sprintf("%d", limit))
-	q.Set("offset", fmt.Sprintf("%d", offset))
-
-	resp, body, err := adminRequest(cmd, http.MethodGet, "/api/admin/push/deliveries?"+q.Encode(), nil)
-	if err != nil {
-		return err
-	}
-	if resp.StatusCode != http.StatusOK {
-		return serverError(resp.StatusCode, body)
-	}
-
-	var result struct {
-		Items []struct {
-			ID        string  `json:"id"`
-			Provider  string  `json:"provider"`
-			Title     string  `json:"title"`
-			Status    string  `json:"status"`
-			ErrorCode *string `json:"error_code"`
-		} `json:"items"`
-	}
-	if err := json.Unmarshal(body, &result); err != nil {
-		return fmt.Errorf("parsing response: %w", err)
-	}
-
-	if outFmt == "json" {
-		enc := json.NewEncoder(os.Stdout)
-		enc.SetIndent("", "  ")
-		return enc.Encode(result.Items)
-	}
-
-	if len(result.Items) == 0 {
-		fmt.Println("No push deliveries found.")
-		return nil
-	}
-
-	if outFmt == "csv" {
-		rows := make([][]string, 0, len(result.Items))
-		for _, item := range result.Items {
-			errorCode := ""
-			if item.ErrorCode != nil {
-				errorCode = *item.ErrorCode
-			}
-			rows = append(rows, []string{
-				item.ID,
-				item.Provider,
-				item.Status,
-				item.Title,
-				errorCode,
-			})
-		}
-		return writeCSVStdout([]string{"ID", "Provider", "Status", "Title", "Error"}, rows)
-	}
-
-	w := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(w, "ID\tPROVIDER\tSTATUS\tTITLE\tERROR")
-	for _, item := range result.Items {
-		errorCode := "-"
-		if item.ErrorCode != nil && strings.TrimSpace(*item.ErrorCode) != "" {
-			errorCode = *item.ErrorCode
-		}
-		fmt.Fprintf(w, "%s\t%s\t%s\t%s\t%s\n", item.ID, item.Provider, item.Status, item.Title, errorCode)
-	}
-	return w.Flush()
 }
 
 func tokenPreview(token string) string {

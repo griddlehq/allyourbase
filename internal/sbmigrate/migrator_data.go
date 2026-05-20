@@ -11,6 +11,11 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 )
 
+type deferredDataTable struct {
+	table   TableInfo
+	lastErr error
+}
+
 // migrateData streams row data from source tables to the target database, deferring tables with unmet foreign key constraints and retrying them after dependencies are resolved.
 func (m *Migrator) migrateData(ctx context.Context, tx *sql.Tx, phaseIdx, totalPhases int) error {
 	phase := migrate.Phase{Name: "Data", Index: phaseIdx, Total: totalPhases}
@@ -22,20 +27,13 @@ func (m *Migrator) migrateData(ctx context.Context, tx *sql.Tx, phaseIdx, totalP
 	}
 	tables = m.filterSkippedTables(tables)
 
-	var totalRows int64
-	for _, t := range tables {
-		totalRows += t.RowCount
-	}
+	totalRows := totalTableRows(tables)
 
 	m.progress.StartPhase(phase, int(totalRows))
 	start := time.Now()
 
 	fmt.Fprintln(m.output, "Copying data...")
 
-	type deferredDataTable struct {
-		table   TableInfo
-		lastErr error
-	}
 	deferred := make([]deferredDataTable, 0)
 
 	copied := 0
@@ -58,49 +56,8 @@ func (m *Migrator) migrateData(ctx context.Context, tx *sql.Tx, phaseIdx, totalP
 		}
 	}
 
-	// Retry deferred tables to resolve FK dependencies where parent rows are copied later.
-	if len(deferred) > 0 {
-		for pass := 1; pass <= len(deferred); pass++ {
-			if len(deferred) == 0 {
-				break
-			}
-
-			next := make([]deferredDataTable, 0, len(deferred))
-			progressed := false
-
-			for i, item := range deferred {
-				savepoint := fmt.Sprintf("ayb_data_table_retry_%d_%d", pass, i)
-				count, err := copyTableDataWithSavepoint(ctx, m.source, tx, item.table, savepoint, func(n int) {
-					m.progress.Progress(phase, copied+n, int(totalRows))
-				})
-				if err != nil {
-					if isRetriableDataTableError(err) {
-						item.lastErr = err
-						next = append(next, item)
-						continue
-					}
-					return fmt.Errorf("copying data for %s: %w", item.table.Name, err)
-				}
-
-				progressed = true
-				copied += count
-				m.stats.Records += count
-				if m.verbose {
-					fmt.Fprintf(m.output, "  %s: %d rows\n", item.table.Name, count)
-				}
-			}
-
-			if !progressed {
-				for _, item := range next {
-					m.markSkippedTable(item.table.Name, item.lastErr)
-					m.stats.Skipped++
-					m.progress.Warn(fmt.Sprintf("skipping data copy for %s due unresolved dependency: %v", item.table.Name, item.lastErr))
-				}
-				break
-			}
-
-			deferred = next
-		}
+	if err := m.retryDeferredDataTables(ctx, tx, phase, totalRows, deferred, &copied); err != nil {
+		return err
 	}
 
 	// Reset sequences.
@@ -113,6 +70,85 @@ func (m *Migrator) migrateData(ctx context.Context, tx *sql.Tx, phaseIdx, totalP
 	m.progress.CompletePhase(phase, int(totalRows), time.Since(start))
 	fmt.Fprintf(m.output, "  ✓ %d records copied across %d tables\n", m.stats.Records, len(tables))
 	return nil
+}
+
+func totalTableRows(tables []TableInfo) int64 {
+	var totalRows int64
+	for _, t := range tables {
+		totalRows += t.RowCount
+	}
+	return totalRows
+}
+
+func (m *Migrator) retryDeferredDataTables(
+	ctx context.Context,
+	tx *sql.Tx,
+	phase migrate.Phase,
+	totalRows int64,
+	deferred []deferredDataTable,
+	copied *int,
+) error {
+	if len(deferred) == 0 {
+		return nil
+	}
+	for pass := 1; pass <= len(deferred); pass++ {
+		if len(deferred) == 0 {
+			return nil
+		}
+		next, progressed, err := m.retryDeferredDataPass(ctx, tx, phase, totalRows, deferred, pass, copied)
+		if err != nil {
+			return err
+		}
+		if !progressed {
+			m.skipUnresolvedDeferredData(next)
+			return nil
+		}
+		deferred = next
+	}
+	return nil
+}
+
+func (m *Migrator) retryDeferredDataPass(
+	ctx context.Context,
+	tx *sql.Tx,
+	phase migrate.Phase,
+	totalRows int64,
+	deferred []deferredDataTable,
+	pass int,
+	copied *int,
+) ([]deferredDataTable, bool, error) {
+	next := make([]deferredDataTable, 0, len(deferred))
+	progressed := false
+	for i, item := range deferred {
+		savepoint := fmt.Sprintf("ayb_data_table_retry_%d_%d", pass, i)
+		count, err := copyTableDataWithSavepoint(ctx, m.source, tx, item.table, savepoint, func(n int) {
+			m.progress.Progress(phase, *copied+n, int(totalRows))
+		})
+		if err != nil {
+			if isRetriableDataTableError(err) {
+				item.lastErr = err
+				next = append(next, item)
+				continue
+			}
+			return nil, false, fmt.Errorf("copying data for %s: %w", item.table.Name, err)
+		}
+
+		progressed = true
+		*copied += count
+		m.stats.Records += count
+		if m.verbose {
+			fmt.Fprintf(m.output, "  %s: %d rows\n", item.table.Name, count)
+		}
+	}
+	return next, progressed, nil
+}
+
+func (m *Migrator) skipUnresolvedDeferredData(deferred []deferredDataTable) {
+	for _, item := range deferred {
+		m.markSkippedTable(item.table.Name, item.lastErr)
+		m.stats.Skipped++
+		m.progress.Warn(fmt.Sprintf("skipping data copy for %s due unresolved dependency: %v", item.table.Name, item.lastErr))
+	}
 }
 
 // copyTableDataWithSavepoint copies data from a source table to the target within a savepoint, rolling back and releasing the savepoint if an error occurs.

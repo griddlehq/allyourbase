@@ -28,11 +28,8 @@ func main() {
 
 // run starts AYB's managed Postgres on a free port, sets TEST_DATABASE_URL, executes the given command with that environment, and gracefully stops Postgres on command completion or signal. It returns the command's exit code, or a non-zero code if startup fails.
 func run() int {
-	args := os.Args[1:]
-	if len(args) > 0 && args[0] == "--" {
-		args = args[1:]
-	}
-	if len(args) < 1 {
+	args, ok := parseChildArgs(os.Args[1:])
+	if !ok {
 		fmt.Fprintln(os.Stderr, "usage: testpg [--] <command> [args...]")
 		return 1
 	}
@@ -100,35 +97,49 @@ func run() int {
 	waitCh := make(chan error, 1)
 	go func() { waitCh <- cmd.Wait() }()
 
+	return waitForChildOrSignal(cmd, waitCh, sigCh, cleanup)
+}
+
+func parseChildArgs(args []string) ([]string, bool) {
+	if len(args) > 0 && args[0] == "--" {
+		args = args[1:]
+	}
+	return args, len(args) >= 1
+}
+
+func waitForChildOrSignal(cmd *exec.Cmd, waitCh <-chan error, sigCh chan os.Signal, cleanup func()) int {
 	select {
 	case err := <-waitCh:
-		if err != nil {
-			if exitErr, ok := err.(*exec.ExitError); ok {
-				return exitErr.ExitCode()
-			}
-			fmt.Fprintf(os.Stderr, "testpg: %v\n", err)
-			return 1
-		}
-		return 0
-
+		return childExitCode(err)
 	case sig := <-sigCh:
-		fmt.Fprintf(os.Stderr, "\ntestpg: received %s, shutting down\n", sig)
-		// Forward the signal to the child process group.
-		if cmd.Process != nil {
-			_ = syscall.Kill(-cmd.Process.Pid, sig.(syscall.Signal))
-		}
-		// Allow a second signal to force-exit immediately.
-		go func() {
-			<-sigCh
-			fmt.Fprintln(os.Stderr, "testpg: forced exit")
-			cleanup()
-			os.Exit(1)
-		}()
-		// Wait for the child to exit after receiving the forwarded signal.
-		<-waitCh
-		// cleanup() runs via defer; return signal exit code.
-		return 128 + int(sig.(syscall.Signal))
+		return handleChildSignal(cmd, waitCh, sigCh, cleanup, sig)
 	}
+}
+
+func childExitCode(err error) int {
+	if err == nil {
+		return 0
+	}
+	if exitErr, ok := err.(*exec.ExitError); ok {
+		return exitErr.ExitCode()
+	}
+	fmt.Fprintf(os.Stderr, "testpg: %v\n", err)
+	return 1
+}
+
+func handleChildSignal(cmd *exec.Cmd, waitCh <-chan error, sigCh chan os.Signal, cleanup func(), sig os.Signal) int {
+	fmt.Fprintf(os.Stderr, "\ntestpg: received %s, shutting down\n", sig)
+	if cmd.Process != nil {
+		_ = syscall.Kill(-cmd.Process.Pid, sig.(syscall.Signal))
+	}
+	go func() {
+		<-sigCh
+		fmt.Fprintln(os.Stderr, "testpg: forced exit")
+		cleanup()
+		os.Exit(1)
+	}()
+	<-waitCh
+	return 128 + int(sig.(syscall.Signal))
 }
 
 func freePort() (int, error) {

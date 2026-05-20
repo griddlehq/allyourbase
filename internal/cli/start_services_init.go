@@ -1,4 +1,3 @@
-// Package cli Stub summary for /Users/stuart/parallel_development/allyourbase_dev/mar19_03_go_code_quality_refactoring/allyourbase_dev/internal/cli/start_services_init.go.
 package cli
 
 import (
@@ -68,7 +67,6 @@ func initDatabaseSignalReceived(sigCh <-chan os.Signal) bool {
 	}
 }
 
-// TODO: Document startInitDatabaseManagedPostgres.
 func startInitDatabaseManagedPostgres(
 	ctx context.Context,
 	cfg *config.Config,
@@ -136,7 +134,7 @@ func applyInitDatabaseBranchURL(cfg *config.Config, branchName string, logger *s
 	return nil
 }
 
-// TODO: Document connectInitDatabasePool.
+// connectInitDatabasePool establishes a connection pool to the configured database URL and returns both the interface and concrete pool.
 func connectInitDatabasePool(
 	ctx context.Context,
 	cfg *config.Config,
@@ -163,7 +161,7 @@ func connectInitDatabasePool(
 	return initPool, pool, nil
 }
 
-// TODO: Document runInitDatabaseMigrations.
+// runInitDatabaseMigrations bootstraps and runs system migrations, applies any --from data import, and then runs user-defined SQL migrations if configured.
 func runInitDatabaseMigrations(
 	ctx context.Context,
 	initPool initDatabasePool,
@@ -208,7 +206,7 @@ func runInitDatabaseMigrations(
 	return nil
 }
 
-// TODO: Document startInitDatabaseSchemaWatcher.
+// startInitDatabaseSchemaWatcher creates a schema cache and starts a background watcher that keeps it up to date via database notifications.
 func startInitDatabaseSchemaWatcher(
 	ctx context.Context,
 	initPool initDatabasePool,
@@ -317,15 +315,15 @@ func initDatabase(
 	return pool, pgMgr, schemaCache, watcherCancel, nil
 }
 
-// initCoreServices creates the mailer, auth service, and storage service.
 func initCoreServices(ctx context.Context, cfg *config.Config, pool *postgres.Pool, logger *slog.Logger) (*coreServices, error) {
 	core := &coreServices{}
-
 	// Build mailer (shared between auth service and email template service).
 	core.mailSvc = buildMailer(cfg, logger)
-
 	// Conditionally create auth service.
 	if cfg.Auth.Enabled {
+		if err := configureAuthArgon2(cfg); err != nil {
+			return nil, fmt.Errorf("configuring auth argon2: %w", err)
+		}
 		core.authSvc = auth.NewService(
 			pool.DB(),
 			cfg.Auth.JWTSecret,
@@ -334,7 +332,6 @@ func initCoreServices(ctx context.Context, cfg *config.Config, pool *postgres.Po
 			cfg.Auth.MinPasswordLength,
 			logger,
 		)
-
 		// Inject mailer into auth service.
 		baseURL := cfg.PublicBaseURL() + "/api"
 		core.authSvc.SetMailer(core.mailSvc, cfg.Email.FromName, baseURL)
@@ -374,7 +371,6 @@ func initCoreServices(ctx context.Context, cfg *config.Config, pool *postgres.Po
 		applyOAuthProviderModeConfig(core.authSvc, cfg)
 		logger.Info("auth enabled", "email_backend", cfg.Email.Backend)
 	}
-
 	// Conditionally create storage service.
 	if cfg.Storage.Enabled {
 		var storageBackend storage.Backend
@@ -414,6 +410,10 @@ func initCoreServices(ctx context.Context, cfg *config.Config, pool *postgres.Po
 	}
 
 	return core, nil
+}
+
+func configureAuthArgon2(cfg *config.Config) error {
+	return auth.ConfigureArgon2(cfg.Auth.Argon2Memory, cfg.Auth.Argon2Time, cfg.Auth.Argon2Threads)
 }
 
 // wireServices creates the HTTP server, wires all services into it, and returns

@@ -18,6 +18,23 @@ func CompactSchemaContext(cache *schema.SchemaCache, maxChars int) string {
 	}
 
 	var builder strings.Builder
+	capabilities := schemaCapabilities(cache)
+	builder.WriteString("capabilities: ")
+	builder.WriteString(strings.Join(capabilities, ", "))
+	builder.WriteString("\n")
+
+	if appendSchemaTables(&builder, cache, maxChars) {
+		return trimWithEllipsis(builder.String(), maxChars)
+	}
+
+	if appendSchemaFunctions(&builder, cache, maxChars) {
+		return trimWithEllipsis(builder.String(), maxChars)
+	}
+
+	return trimWithEllipsis(builder.String(), maxChars)
+}
+
+func schemaCapabilities(cache *schema.SchemaCache) []string {
 	capabilities := []string{"postgres"}
 	if cache.HasPgVector {
 		capabilities = append(capabilities, "pgvector")
@@ -25,10 +42,10 @@ func CompactSchemaContext(cache *schema.SchemaCache, maxChars int) string {
 	if cache.HasPostGIS {
 		capabilities = append(capabilities, "postgis")
 	}
-	builder.WriteString("capabilities: ")
-	builder.WriteString(strings.Join(capabilities, ", "))
-	builder.WriteString("\n")
+	return capabilities
+}
 
+func appendSchemaTables(builder *strings.Builder, cache *schema.SchemaCache, maxChars int) bool {
 	tableKeys := make([]string, 0, len(cache.Tables))
 	for key := range cache.Tables {
 		tableKeys = append(tableKeys, key)
@@ -39,67 +56,16 @@ func CompactSchemaContext(cache *schema.SchemaCache, maxChars int) string {
 		if table == nil {
 			continue
 		}
-		line := fmt.Sprintf("table %s.%s (%s) pk=[%s] RLS=%t\n", table.Schema, table.Name, table.Kind, strings.Join(table.PrimaryKey, ","), table.RLSEnabled)
-		if appendWithBudget(&builder, line, maxChars) {
-			return trimWithEllipsis(builder.String(), maxChars)
-		}
-
-		columnParts := make([]string, 0, len(table.Columns))
-		for _, col := range table.Columns {
-			if col == nil {
-				continue
-			}
-			columnParts = append(columnParts, fmt.Sprintf("%s:%s", col.Name, col.TypeName))
-		}
-		if len(columnParts) > 0 {
-			if appendWithBudget(&builder, "  columns "+strings.Join(columnParts, ", ")+"\n", maxChars) {
-				return trimWithEllipsis(builder.String(), maxChars)
-			}
-		}
-
-		if len(table.ForeignKeys) > 0 {
-			fkParts := make([]string, 0, len(table.ForeignKeys))
-			for _, fk := range table.ForeignKeys {
-				if fk == nil {
-					continue
-				}
-				fkParts = append(fkParts, fmt.Sprintf("%s->%s.%s(%s)", strings.Join(fk.Columns, ","), fk.ReferencedSchema, fk.ReferencedTable, strings.Join(fk.ReferencedColumns, ",")))
-			}
-			sort.Strings(fkParts)
-			if len(fkParts) > 0 && appendWithBudget(&builder, "  fks "+strings.Join(fkParts, "; ")+"\n", maxChars) {
-				return trimWithEllipsis(builder.String(), maxChars)
-			}
-		}
-
-		if len(table.Indexes) > 0 {
-			idxParts := make([]string, 0, len(table.Indexes))
-			for _, idx := range table.Indexes {
-				if idx == nil {
-					continue
-				}
-				idxParts = append(idxParts, idx.Name+"("+idx.Method+")")
-			}
-			sort.Strings(idxParts)
-			if len(idxParts) > 0 && appendWithBudget(&builder, "  indexes "+strings.Join(idxParts, ", ")+"\n", maxChars) {
-				return trimWithEllipsis(builder.String(), maxChars)
-			}
-		}
-
-		if len(table.RLSPolicies) > 0 {
-			policyParts := make([]string, 0, len(table.RLSPolicies))
-			for _, policy := range table.RLSPolicies {
-				if policy == nil {
-					continue
-				}
-				policyParts = append(policyParts, fmt.Sprintf("%s:%s", policy.Name, policy.Command))
-			}
-			sort.Strings(policyParts)
-			if len(policyParts) > 0 && appendWithBudget(&builder, "  RLS "+strings.Join(policyParts, ", ")+"\n", maxChars) {
-				return trimWithEllipsis(builder.String(), maxChars)
+		for _, chunk := range schemaTableChunks(table) {
+			if appendWithBudget(builder, chunk, maxChars) {
+				return true
 			}
 		}
 	}
+	return false
+}
 
+func appendSchemaFunctions(builder *strings.Builder, cache *schema.SchemaCache, maxChars int) bool {
 	functionKeys := make([]string, 0, len(cache.Functions))
 	for key := range cache.Functions {
 		functionKeys = append(functionKeys, key)
@@ -110,13 +76,89 @@ func CompactSchemaContext(cache *schema.SchemaCache, maxChars int) string {
 		if fn == nil {
 			continue
 		}
-		line := fmt.Sprintf("function %s.%s returns %s\n", fn.Schema, fn.Name, fn.ReturnType)
-		if appendWithBudget(&builder, line, maxChars) {
-			return trimWithEllipsis(builder.String(), maxChars)
+		if appendWithBudget(builder, fmt.Sprintf("function %s.%s returns %s\n", fn.Schema, fn.Name, fn.ReturnType), maxChars) {
+			return true
 		}
 	}
+	return false
+}
 
-	return trimWithEllipsis(builder.String(), maxChars)
+func schemaTableChunks(table *schema.Table) []string {
+	chunks := []string{
+		fmt.Sprintf("table %s.%s (%s) pk=[%s] RLS=%t\n", table.Schema, table.Name, table.Kind, strings.Join(table.PrimaryKey, ","), table.RLSEnabled),
+	}
+	if columnChunk := schemaColumnsChunk(table.Columns); columnChunk != "" {
+		chunks = append(chunks, columnChunk)
+	}
+	if fkChunk := schemaForeignKeysChunk(table.ForeignKeys); fkChunk != "" {
+		chunks = append(chunks, fkChunk)
+	}
+	if indexChunk := schemaIndexesChunk(table.Indexes); indexChunk != "" {
+		chunks = append(chunks, indexChunk)
+	}
+	if policyChunk := schemaPoliciesChunk(table.RLSPolicies); policyChunk != "" {
+		chunks = append(chunks, policyChunk)
+	}
+	return chunks
+}
+
+func schemaColumnsChunk(columns []*schema.Column) string {
+	columnParts := make([]string, 0, len(columns))
+	for _, col := range columns {
+		if col == nil {
+			continue
+		}
+		columnParts = append(columnParts, fmt.Sprintf("%s:%s", col.Name, col.TypeName))
+	}
+	if len(columnParts) == 0 {
+		return ""
+	}
+	return "  columns " + strings.Join(columnParts, ", ") + "\n"
+}
+
+func schemaForeignKeysChunk(foreignKeys []*schema.ForeignKey) string {
+	fkParts := make([]string, 0, len(foreignKeys))
+	for _, fk := range foreignKeys {
+		if fk == nil {
+			continue
+		}
+		fkParts = append(fkParts, fmt.Sprintf("%s->%s.%s(%s)", strings.Join(fk.Columns, ","), fk.ReferencedSchema, fk.ReferencedTable, strings.Join(fk.ReferencedColumns, ",")))
+	}
+	sort.Strings(fkParts)
+	if len(fkParts) == 0 {
+		return ""
+	}
+	return "  fks " + strings.Join(fkParts, "; ") + "\n"
+}
+
+func schemaIndexesChunk(indexes []*schema.Index) string {
+	idxParts := make([]string, 0, len(indexes))
+	for _, idx := range indexes {
+		if idx == nil {
+			continue
+		}
+		idxParts = append(idxParts, idx.Name+"("+idx.Method+")")
+	}
+	sort.Strings(idxParts)
+	if len(idxParts) == 0 {
+		return ""
+	}
+	return "  indexes " + strings.Join(idxParts, ", ") + "\n"
+}
+
+func schemaPoliciesChunk(policies []*schema.RLSPolicy) string {
+	policyParts := make([]string, 0, len(policies))
+	for _, policy := range policies {
+		if policy == nil {
+			continue
+		}
+		policyParts = append(policyParts, fmt.Sprintf("%s:%s", policy.Name, policy.Command))
+	}
+	sort.Strings(policyParts)
+	if len(policyParts) == 0 {
+		return ""
+	}
+	return "  RLS " + strings.Join(policyParts, ", ") + "\n"
 }
 
 func appendWithBudget(builder *strings.Builder, chunk string, maxChars int) bool {

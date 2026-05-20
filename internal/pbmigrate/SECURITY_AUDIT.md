@@ -3,7 +3,7 @@
 **Date:** 2026-03-22
 **Scope:** `internal/pbmigrate/` package — PocketBase to PostgreSQL migration
 **Auditor:** Security review (Stage 5 checklist, session s21)
-**Baseline commit:** `d085dec4` (HEAD of `mattman/mar22_pm_03_pbmigrate_hardening`)
+**Baseline commit:** `d085dec4` (HEAD of `batman/mar22_pm_03_pbmigrate_hardening`)
 
 ## Executive Summary
 

@@ -1,4 +1,3 @@
-// Package jobs defines job handlers and scheduling logic for background tasks including OAuth token refresh, usage aggregation, billing sync, and maintenance operations.
 package jobs
 
 import (
@@ -7,11 +6,11 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"os"
 	"time"
 
 	"github.com/allyourbase/ayb/internal/billing"
 	"github.com/allyourbase/ayb/internal/matview"
+	"github.com/allyourbase/ayb/internal/storage"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -35,14 +34,6 @@ const (
 
 var usageSyncNow = func() time.Time { return time.Now() }
 
-type providerTokenRefreshPayload struct {
-	WindowSeconds int `json:"window_seconds"`
-}
-
-type aiUsageAggregationPayload struct {
-	Day string `json:"day"` // optional YYYY-MM-DD UTC; defaults to yesterday UTC
-}
-
 type ProviderTokenRefreshService interface {
 	RefreshExpiringProviderTokens(ctx context.Context, window time.Duration) error
 }
@@ -58,6 +49,27 @@ type billingUsageSyncDataSource interface {
 
 type billingUsageSyncStore struct {
 	pool *pgxpool.Pool
+}
+
+func hasJobPayload(payload json.RawMessage) bool {
+	return len(payload) > 0 && string(payload) != "{}"
+}
+
+func registerSchedule(ctx context.Context, svc *Service, schedule *Schedule) error {
+	if svc == nil {
+		return fmt.Errorf("job service is nil")
+	}
+
+	next, err := CronNextTime(schedule.CronExpr, schedule.Timezone, time.Now())
+	if err != nil {
+		return fmt.Errorf("compute next_run_at for %s: %w", schedule.Name, err)
+	}
+	schedule.NextRunAt = &next
+
+	if _, err := svc.store.UpsertSchedule(ctx, schedule); err != nil {
+		return fmt.Errorf("upsert schedule %s: %w", schedule.Name, err)
+	}
+	return nil
 }
 
 // ListBillableTenants queries the database for tenant IDs with active billing plans and Stripe customer IDs.
@@ -117,12 +129,12 @@ func (s billingUsageSyncStore) GetUsageReport(ctx context.Context, tenantID stri
 }
 
 // RegisterBuiltinHandlers registers all built-in job type handlers.
-func RegisterBuiltinHandlers(svc *Service, pool *pgxpool.Pool, logger *slog.Logger) {
+func RegisterBuiltinHandlers(svc *Service, pool *pgxpool.Pool, storageSvc *storage.Service, logger *slog.Logger) {
 	svc.RegisterHandler("stale_session_cleanup", StaleSessionCleanupHandler(pool, logger))
 	svc.RegisterHandler("webhook_delivery_prune", WebhookDeliveryPruneHandler(pool, logger))
 	svc.RegisterHandler("expired_oauth_cleanup", ExpiredOAuthCleanupHandler(pool, logger))
 	svc.RegisterHandler("expired_auth_cleanup", ExpiredAuthCleanupHandler(pool, logger))
-	svc.RegisterHandler(resumableUploadCleanupJobType, ResumableUploadCleanupHandler(pool, logger))
+	svc.RegisterHandler(resumableUploadCleanupJobType, ResumableUploadCleanupHandler(storageSvc, logger))
 	svc.RegisterHandler("audit_log_retention", AuditLogRetentionHandler(pool, auditLogRetentionDefaultDays, logger))
 	svc.RegisterHandler("request_log_retention", RequestLogRetentionHandler(pool, requestLogRetentionDefaultDays, logger))
 
@@ -155,111 +167,8 @@ func RegisterBillingUsageSyncHandler(svc *Service, billingSvc billing.BillingSer
 	svc.RegisterHandler(billingUsageSyncJobType, BillingUsageSyncJobHandler(billingSvc, billingUsageSyncStore{pool: pool}))
 }
 
-// AIUsageAggregationJobHandler aggregates AI usage for a UTC day.
-func AIUsageAggregationJobHandler(aggregator AIUsageAggregator) JobHandler {
-	return func(ctx context.Context, payload json.RawMessage) error {
-		targetDay := time.Now().UTC().AddDate(0, 0, -1)
-		targetDay = time.Date(targetDay.Year(), targetDay.Month(), targetDay.Day(), 0, 0, 0, 0, time.UTC)
-
-		if len(payload) > 0 && string(payload) != "{}" {
-			var p aiUsageAggregationPayload
-			if err := json.Unmarshal(payload, &p); err != nil {
-				return fmt.Errorf("ai_usage_aggregate_daily: invalid payload: %w", err)
-			}
-			if p.Day != "" {
-				parsed, err := time.Parse("2006-01-02", p.Day)
-				if err != nil {
-					return fmt.Errorf("ai_usage_aggregate_daily: invalid day %q: %w", p.Day, err)
-				}
-				targetDay = parsed.UTC()
-			}
-		}
-
-		if _, err := aggregator.AggregateDailyUsage(ctx, targetDay); err != nil {
-			return fmt.Errorf("ai_usage_aggregate_daily: %w", err)
-		}
-		return nil
-	}
-}
-
-// BillingUsageSyncJobHandler reports metered usage deltas for billable tenants.
-func BillingUsageSyncJobHandler(billingSvc billing.BillingService, ds billingUsageSyncDataSource) JobHandler {
-	return func(ctx context.Context, payload json.RawMessage) error {
-		_ = payload
-		if billingSvc == nil {
-			return fmt.Errorf("billing service is nil")
-		}
-		if ds == nil {
-			return fmt.Errorf("billing usage sync data source is nil")
-		}
-
-		targetDate := usageSyncNow().UTC().Truncate(24 * time.Hour)
-		tenantIDs, err := ds.ListBillableTenants(ctx)
-		if err != nil {
-			return fmt.Errorf("list billable tenants: %w", err)
-		}
-
-		successes := 0
-		failures := 0
-		for _, tenantID := range tenantIDs {
-			report, found, err := ds.GetUsageReport(ctx, tenantID, targetDate)
-			if err != nil {
-				failures++
-				slog.Default().Error("failed to query tenant usage", "tenant_id", tenantID, "error", err)
-				continue
-			}
-			if !found {
-				yesterday := targetDate.AddDate(0, 0, -1)
-				report, found, err = ds.GetUsageReport(ctx, tenantID, yesterday)
-				if err != nil {
-					failures++
-					slog.Default().Error("failed to query tenant usage", "tenant_id", tenantID, "error", err)
-					continue
-				}
-				if !found {
-					slog.Default().Debug("no usage row for tenant in sync window", "tenant_id", tenantID)
-					continue
-				}
-			}
-
-			if err := billingSvc.ReportUsage(ctx, tenantID, report); err != nil {
-				failures++
-				slog.Default().Error("billing usage report failed", "tenant_id", tenantID, "error", err)
-				continue
-			}
-			successes++
-		}
-		slog.Default().Info("billing usage sync summary",
-			"tenants", len(tenantIDs),
-			"success", successes,
-			"failed", failures)
-		return nil
-	}
-}
-
-// ProviderTokenRefreshJobHandler refreshes OAuth provider tokens nearing expiration.
-func ProviderTokenRefreshJobHandler(refresher ProviderTokenRefreshService) JobHandler {
-	return func(ctx context.Context, payload json.RawMessage) error {
-		window := providerTokenRefreshDefaultWindow
-		if len(payload) > 0 && string(payload) != "{}" {
-			var p providerTokenRefreshPayload
-			if err := json.Unmarshal(payload, &p); err != nil {
-				return fmt.Errorf("oauth_provider_tokens_refresh: invalid payload: %w", err)
-			}
-			if p.WindowSeconds > 0 {
-				window = time.Duration(p.WindowSeconds) * time.Second
-			}
-		}
-		return refresher.RefreshExpiringProviderTokens(ctx, window)
-	}
-}
-
 // RegisterProviderTokenRefreshSchedule registers a 5-minute schedule for proactive refresh.
 func RegisterProviderTokenRefreshSchedule(ctx context.Context, svc *Service) error {
-	if svc == nil {
-		return fmt.Errorf("job service is nil")
-	}
-
 	schedule := &Schedule{
 		Name:        providerTokenRefreshScheduleName,
 		JobType:     providerTokenRefreshJobType,
@@ -269,24 +178,11 @@ func RegisterProviderTokenRefreshSchedule(ctx context.Context, svc *Service) err
 		Enabled:     true,
 		MaxAttempts: 3,
 	}
-	next, err := CronNextTime(schedule.CronExpr, schedule.Timezone, time.Now())
-	if err != nil {
-		return fmt.Errorf("compute next_run_at for %s: %w", schedule.Name, err)
-	}
-	schedule.NextRunAt = &next
-
-	if _, err := svc.store.UpsertSchedule(ctx, schedule); err != nil {
-		return fmt.Errorf("upsert provider token refresh schedule %s: %w", schedule.Name, err)
-	}
-	return nil
+	return registerSchedule(ctx, svc, schedule)
 }
 
 // RegisterAIUsageAggregationSchedule registers a daily UTC schedule for AI usage rollups.
 func RegisterAIUsageAggregationSchedule(ctx context.Context, svc *Service) error {
-	if svc == nil {
-		return fmt.Errorf("job service is nil")
-	}
-
 	schedule := &Schedule{
 		Name:        aiUsageAggregationScheduleName,
 		JobType:     AIUsageAggregationJobType,
@@ -296,23 +192,10 @@ func RegisterAIUsageAggregationSchedule(ctx context.Context, svc *Service) error
 		Enabled:     true,
 		MaxAttempts: 3,
 	}
-	next, err := CronNextTime(schedule.CronExpr, schedule.Timezone, time.Now())
-	if err != nil {
-		return fmt.Errorf("compute next_run_at for %s: %w", schedule.Name, err)
-	}
-	schedule.NextRunAt = &next
-
-	if _, err := svc.store.UpsertSchedule(ctx, schedule); err != nil {
-		return fmt.Errorf("upsert ai usage aggregation schedule %s: %w", schedule.Name, err)
-	}
-	return nil
+	return registerSchedule(ctx, svc, schedule)
 }
 
-// RegisterBillingUsageSyncSchedule registers the recurring billing usage sync schedule.
 func RegisterBillingUsageSyncSchedule(ctx context.Context, svc *Service, usageSyncIntervalSecs int) error {
-	if svc == nil {
-		return fmt.Errorf("job service is nil")
-	}
 	cronExpr, err := usageSyncCronExpr(usageSyncIntervalSecs)
 	if err != nil {
 		return fmt.Errorf("compute billing usage sync cron expression: %w", err)
@@ -327,16 +210,7 @@ func RegisterBillingUsageSyncSchedule(ctx context.Context, svc *Service, usageSy
 		Enabled:     true,
 		MaxAttempts: 3,
 	}
-	next, err := CronNextTime(schedule.CronExpr, schedule.Timezone, time.Now())
-	if err != nil {
-		return fmt.Errorf("compute next_run_at for %s: %w", schedule.Name, err)
-	}
-	schedule.NextRunAt = &next
-
-	if _, err := svc.store.UpsertSchedule(ctx, schedule); err != nil {
-		return fmt.Errorf("upsert billing usage sync schedule %s: %w", schedule.Name, err)
-	}
-	return nil
+	return registerSchedule(ctx, svc, schedule)
 }
 
 // usageSyncCronExpr generates a cron expression for the given billing sync interval in seconds. The interval must be positive and a multiple of 60; the returned expression matches the appropriate schedule granularity.
@@ -361,216 +235,5 @@ func usageSyncCronExpr(usageSyncIntervalSecs int) (string, error) {
 		return "0 0 * * *", nil
 	default:
 		return "", fmt.Errorf("unsupported billing usage sync interval: %d seconds", usageSyncIntervalSecs)
-	}
-}
-
-// StaleSessionCleanupHandler deletes expired refresh-token sessions.
-func StaleSessionCleanupHandler(pool *pgxpool.Pool, logger *slog.Logger) JobHandler {
-	return func(ctx context.Context, payload json.RawMessage) error {
-		tag, err := pool.Exec(ctx,
-			`DELETE FROM _ayb_sessions WHERE expires_at < NOW()`)
-		if err != nil {
-			return fmt.Errorf("stale_session_cleanup: %w", err)
-		}
-		logger.Info("stale_session_cleanup completed", "deleted", tag.RowsAffected())
-		return nil
-	}
-}
-
-// webhookPrunePayload is the expected payload for webhook_delivery_prune jobs.
-type webhookPrunePayload struct {
-	RetentionHours int `json:"retention_hours"`
-}
-
-type auditRetentionPayload struct {
-	RetentionDays int `json:"retention_days"`
-}
-
-type requestLogRetentionPayload struct {
-	RetentionDays int `json:"retention_days"`
-}
-
-// WebhookDeliveryPruneHandler deletes old webhook delivery logs.
-func WebhookDeliveryPruneHandler(pool *pgxpool.Pool, logger *slog.Logger) JobHandler {
-	return func(ctx context.Context, payload json.RawMessage) error {
-		var p webhookPrunePayload
-		if len(payload) > 0 && string(payload) != "{}" {
-			if err := json.Unmarshal(payload, &p); err != nil {
-				return fmt.Errorf("webhook_delivery_prune: invalid payload: %w", err)
-			}
-		}
-		if p.RetentionHours <= 0 {
-			p.RetentionHours = 168 // 7 days default
-		}
-
-		tag, err := pool.Exec(ctx,
-			`DELETE FROM _ayb_webhook_deliveries
-			 WHERE delivered_at < NOW() - make_interval(hours => $1)`,
-			p.RetentionHours)
-		if err != nil {
-			return fmt.Errorf("webhook_delivery_prune: %w", err)
-		}
-		logger.Info("webhook_delivery_prune completed",
-			"deleted", tag.RowsAffected(), "retention_hours", p.RetentionHours)
-		return nil
-	}
-}
-
-// ExpiredOAuthCleanupHandler deletes expired/revoked OAuth tokens and used auth codes.
-func ExpiredOAuthCleanupHandler(pool *pgxpool.Pool, logger *slog.Logger) JobHandler {
-	return func(ctx context.Context, payload json.RawMessage) error {
-		// Delete expired OAuth tokens (expired > 1 day ago).
-		tagTokens, err := pool.Exec(ctx,
-			`DELETE FROM _ayb_oauth_tokens
-			 WHERE (expires_at < NOW() - interval '1 day')
-			    OR (revoked_at IS NOT NULL AND revoked_at < NOW() - interval '1 day')`)
-		if err != nil {
-			return fmt.Errorf("expired_oauth_cleanup tokens: %w", err)
-		}
-
-		// Delete expired authorization codes.
-		tagCodes, err := pool.Exec(ctx,
-			`DELETE FROM _ayb_oauth_authorization_codes
-			 WHERE expires_at < NOW()
-			    OR (used_at IS NOT NULL AND used_at < NOW() - interval '1 day')`)
-		if err != nil {
-			return fmt.Errorf("expired_oauth_cleanup codes: %w", err)
-		}
-
-		logger.Info("expired_oauth_cleanup completed",
-			"tokens_deleted", tagTokens.RowsAffected(),
-			"codes_deleted", tagCodes.RowsAffected())
-		return nil
-	}
-}
-
-// ExpiredAuthCleanupHandler deletes expired magic links and password resets.
-func ExpiredAuthCleanupHandler(pool *pgxpool.Pool, logger *slog.Logger) JobHandler {
-	return func(ctx context.Context, payload json.RawMessage) error {
-		tagLinks, err := pool.Exec(ctx,
-			`DELETE FROM _ayb_magic_links WHERE expires_at < NOW()`)
-		if err != nil {
-			return fmt.Errorf("expired_auth_cleanup magic_links: %w", err)
-		}
-
-		tagResets, err := pool.Exec(ctx,
-			`DELETE FROM _ayb_password_resets WHERE expires_at < NOW()`)
-		if err != nil {
-			return fmt.Errorf("expired_auth_cleanup password_resets: %w", err)
-		}
-
-		logger.Info("expired_auth_cleanup completed",
-			"magic_links_deleted", tagLinks.RowsAffected(),
-			"password_resets_deleted", tagResets.RowsAffected())
-		return nil
-	}
-}
-
-// ResumableUploadCleanupHandler removes stale resumable uploads and temp files.
-func ResumableUploadCleanupHandler(pool *pgxpool.Pool, logger *slog.Logger) JobHandler {
-	return func(ctx context.Context, _ json.RawMessage) error {
-		rows, err := pool.Query(ctx, `SELECT path FROM _ayb_storage_uploads WHERE expires_at < NOW()`)
-		if err != nil {
-			return fmt.Errorf("cleanup resumable uploads: query paths: %w", err)
-		}
-		defer rows.Close()
-
-		var paths []string
-		for rows.Next() {
-			var path string
-			if err := rows.Scan(&path); err != nil {
-				return fmt.Errorf("cleanup resumable uploads: scan path: %w", err)
-			}
-			paths = append(paths, path)
-		}
-		if err := rows.Err(); err != nil {
-			return fmt.Errorf("cleanup resumable uploads: read paths: %w", err)
-		}
-
-		tag, err := pool.Exec(ctx, `DELETE FROM _ayb_storage_uploads WHERE expires_at < NOW()`)
-		if err != nil {
-			return fmt.Errorf("cleanup resumable uploads: delete stale sessions: %w", err)
-		}
-
-		for _, path := range paths {
-			if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-				if logger != nil {
-					logger.Warn("failed to remove stale resumable file", "path", path, "error", err)
-				}
-			}
-		}
-
-		if logger != nil {
-			logger.Info("cleanup resumable uploads completed", "deleted", tag.RowsAffected())
-		}
-		return nil
-	}
-}
-
-// AuditLogRetentionHandler deletes audit log entries older than retention_days.
-func AuditLogRetentionHandler(pool *pgxpool.Pool, defaultRetentionDays int, logger *slog.Logger) JobHandler {
-	return func(ctx context.Context, payload json.RawMessage) error {
-		retentionDays := defaultRetentionDays
-		if retentionDays <= 0 {
-			retentionDays = auditLogRetentionDefaultDays
-		}
-
-		var p auditRetentionPayload
-		if len(payload) > 0 && string(payload) != "{}" {
-			if err := json.Unmarshal(payload, &p); err != nil {
-				return fmt.Errorf("audit_log_retention: invalid payload: %w", err)
-			}
-			if p.RetentionDays > 0 {
-				retentionDays = p.RetentionDays
-			}
-		}
-
-		tag, err := pool.Exec(ctx, `
-			DELETE FROM _ayb_audit_log
-			 WHERE timestamp < NOW() - make_interval(days => $1)`,
-			retentionDays)
-		if err != nil {
-			return fmt.Errorf("audit_log_retention: %w", err)
-		}
-		if logger != nil {
-			logger.Info("audit_log_retention completed",
-				"deleted", tag.RowsAffected(),
-				"retention_days", retentionDays)
-		}
-		return nil
-	}
-}
-
-// RequestLogRetentionHandler deletes request logs older than retention_days.
-func RequestLogRetentionHandler(pool *pgxpool.Pool, defaultRetentionDays int, logger *slog.Logger) JobHandler {
-	return func(ctx context.Context, payload json.RawMessage) error {
-		retentionDays := defaultRetentionDays
-		if retentionDays <= 0 {
-			retentionDays = requestLogRetentionDefaultDays
-		}
-
-		var p requestLogRetentionPayload
-		if len(payload) > 0 && string(payload) != "{}" {
-			if err := json.Unmarshal(payload, &p); err != nil {
-				return fmt.Errorf("request_log_retention: invalid payload: %w", err)
-			}
-			if p.RetentionDays > 0 {
-				retentionDays = p.RetentionDays
-			}
-		}
-
-		tag, err := pool.Exec(ctx, `
-			DELETE FROM _ayb_request_logs
-			 WHERE timestamp < NOW() - make_interval(days => $1)`,
-			retentionDays)
-		if err != nil {
-			return fmt.Errorf("request_log_retention: %w", err)
-		}
-		if logger != nil {
-			logger.Info("request_log_retention completed",
-				"deleted", tag.RowsAffected(),
-				"retention_days", retentionDays)
-		}
-		return nil
 	}
 }

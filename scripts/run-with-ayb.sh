@@ -16,16 +16,22 @@ readonly AYB_ADMIN_TOKEN_PATH="${AYB_ADMIN_TOKEN_PATH:-${HOME}/.ayb/admin-token}
 ADMIN_TOKEN_BACKUP_PATH=""
 ADMIN_TOKEN_HAD_ORIGINAL=0
 
-# Browser suites can issue hundreds of requests across workers. Keep local
-# e2e runs from tripping the default API/auth limits unless the caller has
-# already provided explicit limits.
+# Rate-limit overrides prevent load/browser tests from being throttled.
 export AYB_AUTH_RATE_LIMIT="${AYB_AUTH_RATE_LIMIT:-10000}"
 export AYB_AUTH_ANONYMOUS_RATE_LIMIT="${AYB_AUTH_ANONYMOUS_RATE_LIMIT:-10000}"
 export AYB_AUTH_RATE_LIMIT_AUTH="${AYB_AUTH_RATE_LIMIT_AUTH:-10000/min}"
-export AYB_AUTH_ENABLED="${AYB_AUTH_ENABLED:-true}"
-export AYB_AUTH_JWT_SECRET="${AYB_AUTH_JWT_SECRET:-devsecret-min-32-chars-long-000000}"
 export AYB_RATE_LIMIT_API="${AYB_RATE_LIMIT_API:-10000/min}"
 export AYB_RATE_LIMIT_API_ANONYMOUS="${AYB_RATE_LIMIT_API_ANONYMOUS:-10000/min}"
+
+# Auth enablement and JWT secret are only propagated when the caller explicitly
+# sets them (e.g., load_export_auth_env or BROWSER_EXPORT_AUTH_ENV). Baseline
+# load targets deliberately omit auth config.
+if [[ -n "${AYB_AUTH_ENABLED+x}" ]]; then
+  export AYB_AUTH_ENABLED
+fi
+if [[ -n "${AYB_AUTH_JWT_SECRET+x}" ]]; then
+  export AYB_AUTH_JWT_SECRET
+fi
 
 if ! [[ "$AYB_HEALTH_TIMEOUT_SECONDS" =~ ^[0-9]+$ ]] || (( AYB_HEALTH_TIMEOUT_SECONDS < 1 )); then
   echo "AYB_HEALTH_TIMEOUT_SECONDS must be a positive integer; got: $AYB_HEALTH_TIMEOUT_SECONDS" >&2
@@ -65,8 +71,6 @@ prepare_admin_token_file() {
     cp "$AYB_ADMIN_TOKEN_PATH" "$ADMIN_TOKEN_BACKUP_PATH"
     ADMIN_TOKEN_HAD_ORIGINAL=1
   fi
-
-  remove_admin_token_file
 }
 
 # Restore the original admin-token file (or remove the test-generated one) so
@@ -128,7 +132,13 @@ wait_for_ayb_readiness() {
   done
 }
 
+# Always back up any pre-existing admin-token so cleanup can restore it.
+# When AYB_ADMIN_PASSWORD is unset, also remove the token file so AYB
+# generates a fresh password and writes a new one on startup.
 prepare_admin_token_file
+if [[ -z "${AYB_ADMIN_PASSWORD:-}" ]]; then
+  remove_admin_token_file
+fi
 bash -lc "$AYB_START_COMMAND" > "$AYB_START_LOG" 2>&1 &
 AYB_PID=$!
 

@@ -685,6 +685,41 @@ func TestAuthSensitiveEndpointsUseStricterRateLimit(t *testing.T) {
 	testutil.Equal(t, "0", w.Header().Get("X-RateLimit-Remaining"))
 }
 
+func TestAuthRegisterUsesStricterRateLimit(t *testing.T) {
+	t.Parallel()
+
+	secret := "test-secret-that-is-at-least-32-chars!!"
+	cfg := config.Default()
+	cfg.Auth.Enabled = true
+	cfg.Auth.JWTSecret = secret
+	cfg.Auth.RateLimit = 100
+	cfg.Auth.RateLimitAuth = "2/min"
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	ch := schema.NewCacheHolder(nil, logger)
+	authSvc := auth.NewService(nil, secret, time.Hour, 7*24*time.Hour, 8, logger)
+	srv := server.New(cfg, logger, ch, nil, authSvc, nil)
+
+	for i := 0; i < 2; i++ {
+		w := httptest.NewRecorder()
+		req := httptest.NewRequest(http.MethodPost, "/api/auth/register", strings.NewReader(`{"email":"a@b.com","password":"badpassword123"}`))
+		req.Header.Set("Content-Type", "application/json")
+		req.RemoteAddr = "198.51.100.25:4567"
+		srv.Router().ServeHTTP(w, req)
+		testutil.Equal(t, "2", w.Header().Get("X-RateLimit-Limit"))
+		testutil.True(t, w.Code != http.StatusTooManyRequests, "request %d should not be limited yet", i+1)
+	}
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/auth/register", strings.NewReader(`{"email":"a@b.com","password":"badpassword123"}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.RemoteAddr = "198.51.100.25:4567"
+	srv.Router().ServeHTTP(w, req)
+	testutil.Equal(t, http.StatusTooManyRequests, w.Code)
+	testutil.Equal(t, "2", w.Header().Get("X-RateLimit-Limit"))
+	testutil.Equal(t, "0", w.Header().Get("X-RateLimit-Remaining"))
+}
+
 func TestAuthSMSConfirmUsesStricterRateLimit(t *testing.T) {
 	t.Parallel()
 

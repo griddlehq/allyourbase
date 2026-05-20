@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { screen, waitFor, fireEvent, act } from "@testing-library/react";
-import { renderWithProviders } from "../../test-utils";
+import { renderWithProviders, expectWcagContrastToken } from "../../test-utils";
 import userEvent from "@testing-library/user-event";
 import { EmailTemplates } from "../EmailTemplates";
 import {
@@ -138,6 +138,27 @@ describe("EmailTemplates", () => {
     await waitFor(() => {
       expect(mockGetEmailTemplate).toHaveBeenCalledWith("auth.password_reset");
     });
+  });
+
+  it("loading indicator uses WCAG AA compliant contrast token", () => {
+    mockListEmailTemplates.mockReturnValue(new Promise(() => {}));
+    renderWithProviders(<EmailTemplates />);
+
+    const className = screen.getByText("Loading email templates...").className;
+    expectWcagContrastToken(className);
+  });
+
+  it("selected template metadata uses WCAG AA compliant contrast token", async () => {
+    renderWithProviders(<EmailTemplates />);
+    await waitFor(() => {
+      expect(screen.getByText("auth.password_reset")).toBeInTheDocument();
+    });
+
+    const selectedTemplateButton = screen.getByRole("button", { name: /auth\.password_reset/i });
+    const metadataRow = selectedTemplateButton.querySelector(".mt-1");
+    expect(metadataRow).not.toBeNull();
+    expect(metadataRow?.className).toContain("text-gray-600");
+    expect(metadataRow?.className).not.toContain("text-gray-500");
   });
 
   it("switches selected template and loads editor values", async () => {
@@ -336,6 +357,79 @@ describe("EmailTemplates", () => {
         "https://sigil.example/reset/123",
       );
     });
+  });
+
+  it("makes the preview HTML output keyboard-focusable for scroll access", async () => {
+    renderWithProviders(<EmailTemplates />);
+
+    await waitFor(() => {
+      expect(screen.getByTestId("email-template-preview-html")).toBeInTheDocument();
+    });
+
+    expect(screen.getByTestId("email-template-preview-html")).toHaveAttribute("tabindex", "0");
+  });
+
+  it("ignores stale preview responses after a newer render completes", async () => {
+    const stalePreview = deferred<PreviewEmailTemplateResponse>();
+    mockPreviewEmailTemplate
+      .mockResolvedValueOnce(makePreview({ html: "<p>initial</p>" }))
+      .mockImplementationOnce(() => stalePreview.promise)
+      .mockResolvedValueOnce(makePreview({ html: "<p>https://latest.example/reset</p>" }));
+
+    renderWithProviders(<EmailTemplates />);
+
+    await waitFor(() => {
+      expect(screen.getByTestId("email-template-preview-html")).toHaveTextContent("initial");
+    });
+
+    vi.useFakeTimers();
+
+    fireEvent.change(screen.getByLabelText("Preview Variables (JSON)"), {
+      target: {
+        value: JSON.stringify({
+          AppName: "Stale App",
+          ActionURL: "https://stale.example/reset",
+        }),
+      },
+    });
+
+    await act(async () => {
+      vi.advanceTimersByTime(450);
+      await Promise.resolve();
+    });
+
+    expect(mockPreviewEmailTemplate).toHaveBeenCalledTimes(2);
+
+    fireEvent.change(screen.getByLabelText("Preview Variables (JSON)"), {
+      target: {
+        value: JSON.stringify({
+          AppName: "Latest App",
+          ActionURL: "https://latest.example/reset",
+        }),
+      },
+    });
+
+    await act(async () => {
+      vi.advanceTimersByTime(450);
+      await Promise.resolve();
+    });
+
+    expect(mockPreviewEmailTemplate).toHaveBeenCalledTimes(3);
+    expect(screen.getByTestId("email-template-preview-html")).toHaveTextContent(
+      "https://latest.example/reset",
+    );
+
+    await act(async () => {
+      stalePreview.resolve(makePreview({ html: "<p>https://stale.example/reset</p>" }));
+      await Promise.resolve();
+    });
+
+    expect(screen.getByTestId("email-template-preview-html")).toHaveTextContent(
+      "https://latest.example/reset",
+    );
+    expect(screen.getByTestId("email-template-preview-html")).not.toHaveTextContent(
+      "https://stale.example/reset",
+    );
   });
 
   it("reloads effective template after reset to default", async () => {

@@ -146,10 +146,11 @@ func hashPassword(password string) (string, error) {
 		return "", fmt.Errorf("generating salt: %w", err)
 	}
 
-	key := argon2.IDKey([]byte(password), salt, argonTime, argonMemory, argonThreads, argonKeyLen)
+	memory, timeCost, threads := currentArgon2Config()
+	key := argon2.IDKey([]byte(password), salt, timeCost, memory, threads, argonKeyLen)
 
 	return fmt.Sprintf("$argon2id$v=%d$m=%d,t=%d,p=%d$%s$%s",
-		argon2.Version, argonMemory, argonTime, argonThreads,
+		argon2.Version, memory, timeCost, threads,
 		base64.RawStdEncoding.EncodeToString(salt),
 		base64.RawStdEncoding.EncodeToString(key),
 	), nil

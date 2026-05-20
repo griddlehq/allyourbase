@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"time"
 
 	"github.com/golang-jwt/jwt/v5"
 )
@@ -27,7 +26,6 @@ func (s *Service) readJWTSecret() ([]byte, error) {
 	return secret, nil
 }
 
-// ValidateToken parses and validates a JWT token string.
 func (s *Service) ValidateToken(tokenString string) (*Claims, error) {
 	if len(tokenString) > maxJWTTokenLength {
 		return nil, errors.New("token too large")
@@ -44,7 +42,7 @@ func (s *Service) ValidateToken(tokenString string) (*Claims, error) {
 			return nil, fmt.Errorf("unexpected signing method: %v", t.Header["alg"])
 		}
 		return secret, nil
-	})
+	}, jwt.WithTimeFunc(s.nowTime))
 	if err != nil {
 		return nil, fmt.Errorf("invalid token: %w", err)
 	}
@@ -69,14 +67,33 @@ func (s *Service) generateToken(ctx context.Context, user *User) (string, error)
 	return s.generateTokenWithOpts(ctx, user, nil)
 }
 
-// generateTokenWithOpts generates a signed JWT token for the given user with optional claims including authentication assurance level, authentication method references, and session ID. It invokes the custom_access_token hook if configured, allowing hooks to add custom claims to the token.
 func (s *Service) generateTokenWithOpts(ctx context.Context, user *User, opts *tokenOptions) (string, error) {
-	now := time.Now()
+	claims, err := s.newAccessTokenClaims(user)
+	if err != nil {
+		return "", err
+	}
+	applyTokenOptions(claims, opts)
+	if err := s.applyCustomAccessTokenClaims(ctx, user.ID, claims); err != nil {
+		return "", err
+	}
+
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
+	secret, err := s.readJWTSecret()
+	if err != nil {
+		return "", err
+	}
+	return token.SignedString(secret)
+}
+
+// newAccessTokenClaims builds the baseline access-token claims using the service clock.
+func (s *Service) newAccessTokenClaims(user *User) (*Claims, error) {
 	jti := make([]byte, 16)
 	if _, err := rand.Read(jti); err != nil {
-		return "", fmt.Errorf("generating jti: %w", err)
+		return nil, fmt.Errorf("generating jti: %w", err)
 	}
-	claims := &Claims{
+
+	now := s.nowTime()
+	return &Claims{
 		RegisteredClaims: jwt.RegisteredClaims{
 			Subject:   user.ID,
 			IssuedAt:  jwt.NewNumericDate(now),
@@ -86,46 +103,53 @@ func (s *Service) generateTokenWithOpts(ctx context.Context, user *User, opts *t
 		Email:       user.Email,
 		IsAnonymous: user.IsAnonymous,
 		AAL:         "aal1",
+	}, nil
+}
+
+// applyTokenOptions overlays optional auth/session claims onto the base token claims.
+func applyTokenOptions(claims *Claims, opts *tokenOptions) {
+	if opts == nil {
+		return
 	}
-	if opts != nil {
-		if opts.AAL != "" {
-			claims.AAL = opts.AAL
-		}
-		if len(opts.AMR) > 0 {
-			claims.AMR = opts.AMR
-		}
-		if opts.SessionID != "" {
-			claims.SessionID = opts.SessionID
-		}
-		if opts.TenantID != "" {
-			claims.TenantID = opts.TenantID
-		}
+	if opts.AAL != "" {
+		claims.AAL = opts.AAL
+	}
+	if len(opts.AMR) > 0 {
+		claims.AMR = opts.AMR
+	}
+	if opts.SessionID != "" {
+		claims.SessionID = opts.SessionID
+	}
+	if opts.TenantID != "" {
+		claims.TenantID = opts.TenantID
+	}
+}
+
+// applyCustomAccessTokenClaims runs the custom_access_token hook and merges any custom claims.
+func (s *Service) applyCustomAccessTokenClaims(ctx context.Context, userID string, claims *Claims) error {
+	if s.hookDispatcher == nil {
+		return nil
 	}
 
-	if s.hookDispatcher != nil {
-		claimsJSON, err := json.Marshal(claims)
-		if err != nil {
-			return "", fmt.Errorf("marshaling claims for hook: %w", err)
-		}
-		var claimsMap map[string]any
-		if err := json.Unmarshal(claimsJSON, &claimsMap); err != nil {
-			return "", fmt.Errorf("unmarshaling claims for hook: %w", err)
-		}
-		hookClaims, err := s.hookDispatcher.CustomAccessToken(ctx, user.ID, claimsMap)
-		if err != nil {
-			return "", fmt.Errorf("custom_access_token hook failed: %w", err)
-		}
-		if customClaims, ok := hookClaims["custom_claims"].(map[string]any); ok && len(customClaims) > 0 {
-			claims.CustomClaims = customClaims
-		}
-	}
-
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
-	secret, err := s.readJWTSecret()
+	claimsJSON, err := json.Marshal(claims)
 	if err != nil {
-		return "", err
+		return fmt.Errorf("marshaling claims for hook: %w", err)
 	}
-	return token.SignedString(secret)
+
+	var claimsMap map[string]any
+	if err := json.Unmarshal(claimsJSON, &claimsMap); err != nil {
+		return fmt.Errorf("unmarshaling claims for hook: %w", err)
+	}
+
+	hookClaims, err := s.hookDispatcher.CustomAccessToken(ctx, userID, claimsMap)
+	if err != nil {
+		return fmt.Errorf("custom_access_token hook failed: %w", err)
+	}
+	customClaims, ok := hookClaims["custom_claims"].(map[string]any)
+	if ok && len(customClaims) > 0 {
+		claims.CustomClaims = customClaims
+	}
+	return nil
 }
 
 // IssueTestToken generates a JWT for the given user ID and email. Intended for testing.

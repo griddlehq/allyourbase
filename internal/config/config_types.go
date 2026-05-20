@@ -119,12 +119,14 @@ type AdminConfig struct {
 	AllowedIPs     []string `toml:"allowed_ips"`
 }
 
-// AuthConfig holds authentication configuration including JWT secrets, token durations, OAuth providers, OIDC providers, SAML providers, MFA methods, password policies, rate limits, and various authentication hooks.
 type AuthConfig struct {
 	Enabled              bool                     `toml:"enabled"`
 	JWTSecret            string                   `toml:"jwt_secret"`
 	TokenDuration        int                      `toml:"token_duration"`
 	RefreshTokenDuration int                      `toml:"refresh_token_duration"`
+	Argon2Memory         int                      `toml:"argon2_memory"`
+	Argon2Time           int                      `toml:"argon2_time"`
+	Argon2Threads        int                      `toml:"argon2_threads"`
 	RateLimit            int                      `toml:"rate_limit"`
 	AnonymousRateLimit   int                      `toml:"anonymous_rate_limit"`
 	RateLimitAuth        string                   `toml:"rate_limit_auth"`

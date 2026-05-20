@@ -139,6 +139,7 @@ assert_contains tests/load/lib/realtime.js "buildRealtimeUnsubscribeMessage(" "r
 assert_contains tests/load/lib/realtime.js "assertRealtimeConnectedMessage(" "reusable realtime flow helper should enforce initial connected message contract"
 assert_contains tests/load/lib/realtime.js "assertRealtimeReplyOK(" "reusable realtime flow helper should enforce subscribe/unsubscribe reply contracts"
 assert_contains tests/load/lib/realtime.js "assertRealtimeEventMessage(" "reusable realtime flow helper should enforce event payload contract"
+assert_contains tests/load/lib/realtime.js "ignore unrelated realtime events emitted for other VUs that share the table subscription" "reusable realtime flow helper should ignore same-table events for other VU row ids before asserting the expected record id"
 assert_contains tests/load/lib/realtime.js "realtimeMessageTimeoutMillis()" "reusable realtime flow helper should use shared websocket message timeout helper"
 
 assert_contains tests/load/scenarios/realtime_ws_subscribe.js "import ws from 'k6/ws';" "realtime scenario should use k6 websocket client"
@@ -170,8 +171,8 @@ assert_contains Makefile "load-realtime-ws-local:" "makefile should expose local
 assert_not_contains Makefile "\"type\":\"subscribe\"" "makefile should not duplicate websocket subscribe payload bodies"
 assert_not_contains Makefile "/api/realtime/ws" "makefile should not duplicate websocket endpoint specifics"
 
-assert_contains tests/test_load_harness.sh "make load-realtime-ws" "harness regression should validate direct Stage 5 realtime target"
-assert_contains tests/test_load_harness.sh "make load-realtime-ws-local" "harness regression should validate local Stage 5 realtime target"
+assert_contains tests/test_load_harness.sh "load-realtime-ws" "harness regression should validate direct Stage 5 realtime target"
+assert_contains tests/test_load_harness.sh "load-realtime-ws-local" "harness regression should validate local Stage 5 realtime target"
 assert_contains tests/test_load_harness.sh "tests/load/scenarios/realtime_ws_subscribe.js" "harness regression should assert realtime target executes Stage 5 scenario"
 assert_contains tests/test_load_harness.sh "realtime local target should enable auth for the started server" "harness regression should lock realtime-local auth enablement"
 assert_contains tests/test_load_harness.sh "realtime local target should inject a non-empty, non-static jwt secret for the started server" "harness regression should lock realtime-local jwt env export"
