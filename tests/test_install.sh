@@ -118,7 +118,7 @@ if [ -n "${GITHUB_REPOSITORY:-}" ]; then
         "Default REPO should be gridlhq-staging/allyourbase in staging environment" \
         'REPO=.*gridlhq-staging/allyourbase'
       ;;
-    gridlhq/allyourbase)
+    gridlhq/allyourbase|griddlehq/allyourbase)
       if install_script_matches 'REPO=.*gridlhq/allyourbase' && ! install_script_matches 'gridlhq-staging'; then
         pass "Default REPO is gridlhq/allyourbase (production environment)"
       else
