@@ -7,7 +7,7 @@ This directory contains reference manifests for package manager distribution.
 - Replace `0.0.0` with the release version when preparing a manual submission.
 - Replace placeholder checksums and Nix hashes with real values from release artifacts.
 - Public release artifact URLs follow:
-  - `https://github.com/gridlhq/allyourbase/releases/download/vVERSION/ayb_VERSION_OS_ARCH.tar.gz`
+  - `https://github.com/griddlehq/allyourbase/releases/download/vVERSION/ayb_VERSION_OS_ARCH.tar.gz`
   - Windows archives use `.zip`.
 
 ## winget (manual submit)
@@ -20,7 +20,7 @@ This directory contains reference manifests for package manager distribution.
 
 1. Keep `scoop/ayb.json` as a manual reference template.
 2. Update `version`, architecture URLs, and hashes.
-3. Open a PR against the Scoop bucket repository (for example `gridlhq/scoop-bucket`).
+3. Open a PR against the Scoop bucket repository (for example `griddlehq/scoop-bucket`).
 
 Note: goreleaser also auto-generates Scoop metadata during release via `.goreleaser.yaml`.
 

@@ -1,7 +1,7 @@
 # 👾 Allyourbase ![Beta](https://img.shields.io/badge/status-beta-orange)
 
-[![CI](https://github.com/gridlhq/allyourbase/actions/workflows/ci.yml/badge.svg)](https://github.com/gridlhq/allyourbase/actions/workflows/ci.yml)
-[![Release](https://github.com/gridlhq/allyourbase/actions/workflows/release.yml/badge.svg)](https://github.com/gridlhq/allyourbase/releases)
+[![CI](https://github.com/griddlehq/allyourbase/actions/workflows/ci.yml/badge.svg)](https://github.com/griddlehq/allyourbase/actions/workflows/ci.yml)
+[![Release](https://github.com/griddlehq/allyourbase/actions/workflows/release.yml/badge.svg)](https://github.com/griddlehq/allyourbase/releases)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 Open-source backend for PostgreSQL. Single binary. Auto-generated REST API, auth, realtime, storage, admin dashboard.
@@ -221,7 +221,7 @@ curl -fsSLo /tmp/ayb-install.sh https://install.allyourbase.io/install.sh
 sh /tmp/ayb-install.sh
 
 # From source
-git clone https://github.com/gridlhq/allyourbase.git && cd allyourbase && make build
+git clone https://github.com/griddlehq/allyourbase.git && cd allyourbase && make build
 
 # Specific version
 curl -fsSLo /tmp/ayb-install.sh https://install.allyourbase.io/install.sh
@@ -248,5 +248,3 @@ sh /tmp/ayb-install.sh v0.0.6-beta
 ## License
 
 [MIT](LICENSE)
-
-<!-- stage5-prod-trigger-verification 2026-05-20 -->
