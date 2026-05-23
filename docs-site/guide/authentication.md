@@ -586,6 +586,25 @@ client_secret = "your-github-client-secret"
    http://localhost:5173/oauth-callback#token=eyJ...&refreshToken=eyJ...
    ```
 
+### Per-request `redirect_to`
+
+If you need different callback destinations per request, include
+`redirect_to` on the OAuth start endpoint and configure an explicit host
+allowlist:
+
+```bash
+GET /api/auth/oauth/google?redirect_to=https://app.example.com/post-auth
+```
+
+```bash
+AYB_AUTH_OAUTH_RETURN_TO_ALLOWLIST=app.example.com,admin.example.com,localhost,127.0.0.1
+```
+
+`redirect_to` is accepted only when it passes server-side validation in
+`validatedOAuthReturnTo` (`internal/auth/handler_oauth.go`). Keep
+`AYB_AUTH_OAUTH_REDIRECT_URL` configured as the fallback destination when a
+request does not include `redirect_to`.
+
 ### Environment variables
 
 ```bash

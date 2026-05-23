@@ -29,12 +29,12 @@ sh /tmp/ayb-install.sh
 
 ### Binary download
 
-Download the latest release from [GitHub Releases](https://github.com/gridlhq/allyourbase/releases) for your OS and architecture.
+Download the latest release from [GitHub Releases](https://github.com/griddlehq/allyourbase/releases) for your OS and architecture.
 
 ### From source
 
 ```bash
-git clone https://github.com/gridlhq/allyourbase.git
+git clone https://github.com/griddlehq/allyourbase.git
 cd allyourbase
 make build
 ```

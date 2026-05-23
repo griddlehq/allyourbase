@@ -3,6 +3,9 @@
 
 AYB supports migration from 6 source platforms and ongoing SQL migration workflows after import.
 
+Firebase migration support remains historical in-tree and retired from roadmap scope. No new
+Firebase live-validation or expansion work is scheduled.
+
 ## Migrate in one command (`ayb start --from`)
 
 For the fastest path, start AYB and migrate in one step:
