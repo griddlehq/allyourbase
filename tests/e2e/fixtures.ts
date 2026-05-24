@@ -1,3 +1,6 @@
+/**
+ * @module Stub summary for fixtures.ts.
+ */
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { accessSync, constants } from "node:fs";
 import { dirname, join } from "node:path";
@@ -28,6 +31,11 @@ export const STAGE5_NOT_IMPLEMENTED_ERROR =
 
 const API_HEALTH_URL = "http://127.0.0.1:8090/health";
 const API_PORT = 8090;
+const CROSS_DEMO_LIVE_ENV = "CROSS_DEMO_LIVE";
+const DEMO_KANBAN_URL_ENV = "DEMO_KANBAN_URL";
+const DEMO_POLLS_URL_ENV = "DEMO_POLLS_URL";
+const DEMO_MOVIES_URL_ENV = "DEMO_MOVIES_URL";
+const DEMO_API_URL_ENV = "DEMO_API_URL";
 const OLLAMA_FAKE_PORT = 11_434;
 const OLLAMA_FAKE_HEALTH_URL = `http://127.0.0.1:${OLLAMA_FAKE_PORT}/health`;
 const READINESS_TIMEOUT_MS = 60_000;
@@ -122,14 +130,75 @@ function demoTargetByName(demoName: DemoName): DemoTarget {
   return target;
 }
 
+function isCrossDemoLiveEnabled(env: NodeJS.ProcessEnv): boolean {
+  return (env[CROSS_DEMO_LIVE_ENV] ?? "").trim() === "1";
+}
+
+function readRequiredTrimmedEnvValue(env: NodeJS.ProcessEnv, key: string): string {
+  const value = (env[key] ?? "").trim();
+  if (value === "") {
+    throw new Error(`${key} is required when ${CROSS_DEMO_LIVE_ENV}=1`);
+  }
+  return value;
+}
+
+function trimTrailingSlashes(value: string): string {
+  return value.replace(/\/+$/, "");
+}
+
+/**
+ * TODO: Document resolveDemoTargetForRuntime.
+ */
+function resolveDemoTargetForRuntime(demoName: DemoName, env: NodeJS.ProcessEnv): DemoTarget {
+  const baseTarget = demoTargetByName(demoName);
+  if (!isCrossDemoLiveEnabled(env)) {
+    return baseTarget;
+  }
+
+  const envKeyByDemo: Record<DemoName, string> = {
+    kanban: DEMO_KANBAN_URL_ENV,
+    "live-polls": DEMO_POLLS_URL_ENV,
+    movies: DEMO_MOVIES_URL_ENV,
+  };
+
+  const liveUrl = readRequiredTrimmedEnvValue(env, envKeyByDemo[demoName]);
+  return {
+    ...baseTarget,
+    url: liveUrl,
+  };
+}
+
+function resolveApiHealthUrl(env: NodeJS.ProcessEnv): string {
+  if (!isCrossDemoLiveEnabled(env)) {
+    return API_HEALTH_URL;
+  }
+  const apiBaseUrl = readRequiredTrimmedEnvValue(env, DEMO_API_URL_ENV);
+  return `${trimTrailingSlashes(apiBaseUrl)}/health`;
+}
+
+export function resolveDemoTargetForTest(demoName: DemoName, env: NodeJS.ProcessEnv): DemoTarget {
+  return resolveDemoTargetForRuntime(demoName, env);
+}
+
+export function resolveApiHealthUrlForTest(env: NodeJS.ProcessEnv): string {
+  return resolveApiHealthUrl(env);
+}
+
 export interface OrchestrationContext {
   demoTarget: DemoTarget;
 }
 
 interface SpawnedProcess {
   process: ChildProcess;
+  label: string;
+  command: string;
+  args: readonly string[];
+  spawnError?: Error;
 }
 
+/**
+ * TODO: Document resolveAybBin.
+ */
 function resolveAybBin(): string {
   if (process.env.AYB_BIN && process.env.AYB_BIN.trim() !== "") {
     return process.env.AYB_BIN;
@@ -152,6 +221,9 @@ function resolveAybBin(): string {
   return "ayb";
 }
 
+/**
+ * TODO: Document spawnManagedProcess.
+ */
 function spawnManagedProcess(
   command: string,
   args: string[],
@@ -167,14 +239,56 @@ function spawnManagedProcess(
     stdio: "ignore",
   });
 
-  return {
+  const managedProcess: SpawnedProcess = {
     process: proc,
+    label: [command, ...args].join(" "),
+    command,
+    args,
   };
+
+  proc.once("error", (error) => {
+    managedProcess.spawnError = error;
+  });
+
+  return managedProcess;
 }
 
-async function waitForUrl(url: string, timeoutMs: number): Promise<void> {
+/**
+ * TODO: Document waitForUrl.
+ */
+function assertProcessStillRunning(managedProcess: SpawnedProcess, readinessTarget: string): void {
+  if (managedProcess.spawnError) {
+    throw new Error(
+      `Process failed before ${readinessTarget}: ${managedProcess.label}: ${managedProcess.spawnError.message}`,
+    );
+  }
+
+  if (managedProcess.process.signalCode !== null) {
+    throw new Error(
+      `Process exited before ${readinessTarget}: ${managedProcess.label} (exitCode=${managedProcess.process.exitCode ?? "null"}, signal=${managedProcess.process.signalCode})`,
+    );
+  }
+
+  if (managedProcess.process.exitCode !== null && managedProcess.process.exitCode !== 0) {
+    throw new Error(
+      `Process exited before ${readinessTarget}: ${managedProcess.label} (exitCode=${managedProcess.process.exitCode ?? "null"}, signal=${managedProcess.process.signalCode ?? "null"})`,
+    );
+  }
+}
+
+/**
+ * TODO: Document waitForUrl.
+ */
+async function waitForUrl(
+  url: string,
+  timeoutMs: number,
+  managedProcess?: SpawnedProcess,
+): Promise<void> {
   const deadlineMs = Date.now() + timeoutMs;
   while (Date.now() < deadlineMs) {
+    if (managedProcess) {
+      assertProcessStillRunning(managedProcess, `URL readiness at ${url}`);
+    }
     try {
       const response = await fetch(url, {
         signal: AbortSignal.timeout(2_000),
@@ -188,12 +302,23 @@ async function waitForUrl(url: string, timeoutMs: number): Promise<void> {
     await sleep(POLL_INTERVAL_MS);
   }
 
+  if (managedProcess) {
+    assertProcessStillRunning(managedProcess, `URL readiness at ${url}`);
+  }
   throw new Error(`Timed out waiting for URL readiness: ${url}`);
 }
 
-async function waitForFakeOllama(url: string, timeoutMs: number): Promise<void> {
+/**
+ * TODO: Document waitForFakeOllama.
+ */
+async function waitForFakeOllama(
+  url: string,
+  timeoutMs: number,
+  managedProcess: SpawnedProcess,
+): Promise<void> {
   const deadlineMs = Date.now() + timeoutMs;
   while (Date.now() < deadlineMs) {
+    assertProcessStillRunning(managedProcess, `fake Ollama readiness at ${url}`);
     try {
       const response = await fetch(url, {
         signal: AbortSignal.timeout(2_000),
@@ -210,6 +335,7 @@ async function waitForFakeOllama(url: string, timeoutMs: number): Promise<void> 
     await sleep(POLL_INTERVAL_MS);
   }
 
+  assertProcessStillRunning(managedProcess, `fake Ollama readiness at ${url}`);
   throw new Error(`Timed out waiting for fake Ollama readiness: ${url}`);
 }
 
@@ -233,6 +359,9 @@ async function stopProcessWithFallback(managedProcess: SpawnedProcess): Promise<
   }
 }
 
+/**
+ * TODO: Document waitForProcessExit.
+ */
 function waitForProcessExit(proc: ChildProcess, timeoutMs: number): Promise<boolean> {
   if (proc.exitCode !== null || proc.killed) {
     return Promise.resolve(true);
@@ -336,7 +465,17 @@ export async function orchestrateDemoRoundtrip(
     throw new Error(`${STAGE5_NOT_IMPLEMENTED_ERROR} Demo: ${demoName}`);
   }
 
-  const demoTarget = demoTargetByName(demoName);
+  const liveMode = isCrossDemoLiveEnabled(process.env);
+  const demoTarget = resolveDemoTargetForRuntime(demoName, process.env);
+  const apiHealthUrl = resolveApiHealthUrl(process.env);
+
+  if (liveMode) {
+    await waitForUrl(apiHealthUrl, READINESS_TIMEOUT_MS);
+    await waitForUrl(demoTarget.url, READINESS_TIMEOUT_MS);
+    await executeRoundtrip({ demoTarget });
+    return;
+  }
+
   const runtimePlan = runtimePlanForDemoTarget(demoTarget);
   const orchestrationManagedPorts = managedPortsForDemoTarget(demoTarget);
   const aybBin = resolveAybBin();
@@ -350,7 +489,7 @@ export async function orchestrateDemoRoundtrip(
       const fakeOllamaProcess = spawnManagedProcess("node", [MOVIES_FAKE_OLLAMA_SCRIPT_PATH]);
       managedProcesses.push(fakeOllamaProcess);
 
-      await waitForFakeOllama(OLLAMA_FAKE_HEALTH_URL, READINESS_TIMEOUT_MS);
+      await waitForFakeOllama(OLLAMA_FAKE_HEALTH_URL, READINESS_TIMEOUT_MS, fakeOllamaProcess);
     }
 
     const apiStartArgs = runtimePlan.aybConfigPath
@@ -368,12 +507,12 @@ export async function orchestrateDemoRoundtrip(
     });
     managedProcesses.push(apiProcess);
 
-    await waitForUrl(API_HEALTH_URL, READINESS_TIMEOUT_MS);
+    await waitForUrl(apiHealthUrl, READINESS_TIMEOUT_MS, apiProcess);
 
     const demoProcess = spawnManagedProcess(aybBin, ["demo", demoName]);
     managedProcesses.push(demoProcess);
 
-    await waitForUrl(demoTarget.url, READINESS_TIMEOUT_MS);
+    await waitForUrl(demoTarget.url, READINESS_TIMEOUT_MS, demoProcess);
 
     await executeRoundtrip({ demoTarget });
   } finally {
