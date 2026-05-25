@@ -1,6 +1,3 @@
-/**
- * @module Stub summary for fixtures.ts.
- */
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { accessSync, constants } from "node:fs";
 import { dirname, join } from "node:path";
@@ -146,9 +143,6 @@ function trimTrailingSlashes(value: string): string {
   return value.replace(/\/+$/, "");
 }
 
-/**
- * TODO: Document resolveDemoTargetForRuntime.
- */
 function resolveDemoTargetForRuntime(demoName: DemoName, env: NodeJS.ProcessEnv): DemoTarget {
   const baseTarget = demoTargetByName(demoName);
   if (!isCrossDemoLiveEnabled(env)) {
@@ -196,9 +190,6 @@ interface SpawnedProcess {
   spawnError?: Error;
 }
 
-/**
- * TODO: Document resolveAybBin.
- */
 function resolveAybBin(): string {
   if (process.env.AYB_BIN && process.env.AYB_BIN.trim() !== "") {
     return process.env.AYB_BIN;
@@ -221,9 +212,6 @@ function resolveAybBin(): string {
   return "ayb";
 }
 
-/**
- * TODO: Document spawnManagedProcess.
- */
 function spawnManagedProcess(
   command: string,
   args: string[],
@@ -276,9 +264,6 @@ function assertProcessStillRunning(managedProcess: SpawnedProcess, readinessTarg
   }
 }
 
-/**
- * TODO: Document waitForUrl.
- */
 async function waitForUrl(
   url: string,
   timeoutMs: number,
@@ -308,9 +293,6 @@ async function waitForUrl(
   throw new Error(`Timed out waiting for URL readiness: ${url}`);
 }
 
-/**
- * TODO: Document waitForFakeOllama.
- */
 async function waitForFakeOllama(
   url: string,
   timeoutMs: number,
@@ -359,9 +341,6 @@ async function stopProcessWithFallback(managedProcess: SpawnedProcess): Promise<
   }
 }
 
-/**
- * TODO: Document waitForProcessExit.
- */
 function waitForProcessExit(proc: ChildProcess, timeoutMs: number): Promise<boolean> {
   if (proc.exitCode !== null || proc.killed) {
     return Promise.resolve(true);
