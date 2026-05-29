@@ -1,0 +1,36 @@
+name: Probe Live Polls Cloudflare Pages
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+    steps:
+      - name: Probe Cloudflare Pages and live baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          tmp_json="$(mktemp)"
+          curl -fsS -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+            "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/pages/projects" \
+            > "$tmp_json"
+
+          echo "=== PROJECTS ==="
+          jq -r '.result[] | "name=\(.name)  prod_branch=\(.production_branch)  domains=\(.domains | join(","))"' "$tmp_json"
+
+          echo "=== POLLS DOMAIN MATCH ==="
+          jq -r '.result[]
+            | select(.domains | index("polls.demo.allyourbase.io"))
+            | "name=\(.name)  prod_branch=\(.production_branch)  domains=\(.domains | join(","))"' "$tmp_json"
+
+          echo "=== LIVE BASELINE ==="
+          curl -fsSI https://polls.demo.allyourbase.io/
+          curl -fsS https://polls.demo.allyourbase.io/ | grep -oE "index-[A-Za-z0-9_-]+\\.js" | head -1
