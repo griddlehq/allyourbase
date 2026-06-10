@@ -36,7 +36,7 @@ test.describe("Auth Passkey Lifecycle (Full E2E)", () => {
       anonymous_auth_enabled: true,
     });
 
-    const virtualAuthenticator = await createVirtualAuthenticator(page);
+    let virtualAuthenticator: Awaited<ReturnType<typeof createVirtualAuthenticator>> | null = null;
     try {
       await test.step("Auth Settings: verify WebAuthn is enabled", async () => {
         await page.goto("/admin/");
@@ -52,9 +52,11 @@ test.describe("Auth Passkey Lifecycle (Full E2E)", () => {
         await page.locator("aside").getByRole("button", { name: /MFA Management/i }).click();
         await expect(page.getByRole("heading", { name: /Multi-Factor Authentication/i })).toBeVisible({ timeout: 5000 });
         await expect(page.getByRole("button", { name: /Register Passkey/i })).toBeVisible({ timeout: 5000 });
+        virtualAuthenticator = await createVirtualAuthenticator(page);
 
         await page.getByTestId("passkey-display-name-input").fill(passkeyName);
         await page.getByTestId("passkey-register-button").click();
+        await expect(page.getByText(`Passkey "${passkeyName}" registered`)).toBeVisible({ timeout: 10000 });
         await expect(page.getByTestId("passkey-name")).toContainText(passkeyName, { timeout: 10000 });
       });
 
@@ -62,7 +64,7 @@ test.describe("Auth Passkey Lifecycle (Full E2E)", () => {
         await expect(page.getByTestId("aal-level-indicator")).toContainText(/AAL2/i, { timeout: 5000 });
       });
     } finally {
-      await virtualAuthenticator.remove();
+      await virtualAuthenticator?.remove();
     }
   });
 });

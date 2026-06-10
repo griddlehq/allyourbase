@@ -6,6 +6,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+## [0.0.10-beta] - 2026-06-09
+
+### Added
+
+- Search-engine depth: collection search now ships `_highlightResult` metadata beside legacy `_highlight`, default English stemming, relevance-first ordering, hybrid search pagination after text/vector fusion, and semantic-mode rejection of incompatible `highlight`, `fuzzy`, `facets`, and `typo_threshold` modifiers across backend behavior, JS SDK types, OpenAPI, and the public search guide.
+- Algolia importer: `ayb migrate algolia` imports one Algolia index into PostgreSQL with dry-run, JSON output, fixture-backed acceptance, optional supported synonym import, and public migration guidance.
+- InstantSearch support: `@allyourbase/js/instantsearch` ships a one-index adapter over `records.list`, with empty-query browsing, facet transposition, `_highlightResult` passthrough, strict unsupported-feature rejection, a source-only `examples/instantsearch_demo` proof app, browser-unmocked coverage, and the dedicated public guide at `docs-site/guide/instantsearch.md`.
+
+### Changed
+
+- Beta limitations now live in `docs-site/guide/beta-limitations.md`, with the README linking there instead of duplicating caveats; codehealth status wording also reflects the live allowlisted Go file-size baseline and the empty function-size allowlist instead of claiming no oversized-file debt.
+- Search helper parity is now documented as shipped across the JavaScript, Go, Python, Dart, Kotlin, Swift, and React-facing surfaces where those SDKs expose collection list helpers.
+- Passkey helper parity remains open outside the JavaScript and React SDKs; resident-key passkey registration remains a backend limitation.
+
+### Fixed
+
+## [0.0.9-beta] - 2026-06-03
+
 ### Added
 - Web hosting MVP: `ayb sites deploy` uploads static sites with deploy/promote/rollback lifecycle, host-based routing, and SPA fallback serving via the admin API
 - Admin dashboard: new panels for organizations, tenants, usage metering, request logs, realtime event inspector, storage browser with CDN purge, and site/deploy management
@@ -17,6 +35,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - `ayb stats` for server statistics
 - `ayb rpc` for calling PostgreSQL functions from CLI
 - `ayb query` for querying records from CLI
+- Faceted search: REST `facets` query parameter returns per-value counts honoring RLS scoping; dashboard search playground exposes a faceted filter UI; JS SDK `ListParams` adds `facets` with `FacetCounts` response typing
+- Login rate-limiting middleware throttles password and anonymous-auth attempts to mitigate credential-stuffing
+- Search facet user guide published at `docs-site/guide/search.md`
 - Security audit: auth bypass, RLS enforcement, API key scoping, secrets handling
 - Performance baseline: 1.9K–21K req/s, 310ms startup, 20.5MB RSS
 - OpenAPI spec served at `/api/openapi.yaml`
