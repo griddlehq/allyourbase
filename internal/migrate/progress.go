@@ -155,18 +155,20 @@ func DetectSource(from string) SourceType {
 
 // AnalysisReport summarizes what a migration will do, shown before proceeding.
 type AnalysisReport struct {
-	SourceType    string   `json:"sourceType"`
-	SourceInfo    string   `json:"sourceInfo"` // e.g., "PocketBase v0.22, SQLite 7.2 MB"
-	Tables        int      `json:"tables"`
-	Views         int      `json:"views"`
-	Records       int      `json:"records"`
-	AuthUsers     int      `json:"authUsers"`
-	OAuthLinks    int      `json:"oauthLinks"`
-	RLSPolicies   int      `json:"rlsPolicies"`
-	Files         int      `json:"files"`
-	FileSizeBytes int64    `json:"fileSizeBytes"`
-	SynonymGroups int      `json:"synonymGroups,omitempty"`
-	Warnings      []string `json:"warnings,omitempty"`
+	SourceType         string   `json:"sourceType"`
+	SourceInfo         string   `json:"sourceInfo"` // e.g., "PocketBase v0.22, SQLite 7.2 MB"
+	Tables             int      `json:"tables"`
+	Views              int      `json:"views"`
+	Records            int      `json:"records"`
+	AuthUsers          int      `json:"authUsers"`
+	OAuthLinks         int      `json:"oauthLinks"`
+	RLSPolicies        int      `json:"rlsPolicies"`
+	Files              int      `json:"files"`
+	FileSizeBytes      int64    `json:"fileSizeBytes"`
+	SynonymGroups      int      `json:"synonymGroups,omitempty"`
+	SettingsAttributes int      `json:"settingsAttributes,omitempty"`
+	SettingsRanking    int      `json:"settingsRanking,omitempty"`
+	Warnings           []string `json:"warnings,omitempty"`
 }
 
 // PrintReport writes a formatted pre-flight report to w.
@@ -195,6 +197,9 @@ func (r *AnalysisReport) PrintReport(w io.Writer) {
 	}
 	if r.Files > 0 {
 		fmt.Fprintf(w, "  Files:        %d (%s)\n", r.Files, FormatBytes(r.FileSizeBytes))
+	}
+	if r.SettingsAttributes > 0 || r.SettingsRanking > 0 {
+		fmt.Fprintf(w, "  Settings:     %d attributes, %d ranking\n", r.SettingsAttributes, r.SettingsRanking)
 	}
 	if r.SynonymGroups > 0 {
 		fmt.Fprintf(w, "  Synonyms:     %d groups\n", r.SynonymGroups)

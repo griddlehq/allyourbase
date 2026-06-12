@@ -1,4 +1,4 @@
-// Package algoliamigrate.
+// Package algoliamigrate imports records and relevance settings from Algolia.
 package algoliamigrate
 
 import (
@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -37,12 +38,9 @@ func NewBrowseClient(cfg BrowseConfig) (*BrowseClient, error) {
 		return nil, errors.New("algolia index name is required")
 	}
 
-	endpoint := strings.TrimRight(strings.TrimSpace(cfg.Endpoint), "/")
-	if endpoint == "" {
-		endpoint = "https://" + strings.ToLower(cfg.AppID) + "-dsn.algolia.net"
-	}
-	if _, err := url.ParseRequestURI(endpoint); err != nil {
-		return nil, fmt.Errorf("invalid algolia endpoint: %w", err)
+	endpoint, err := normalizeAlgoliaEndpoint(cfg.Endpoint, cfg.AppID)
+	if err != nil {
+		return nil, err
 	}
 
 	httpClient := cfg.HTTPClient
@@ -57,6 +55,56 @@ func NewBrowseClient(cfg BrowseConfig) (*BrowseClient, error) {
 		indexName:  cfg.IndexName,
 		httpClient: httpClient,
 	}, nil
+}
+
+func normalizeAlgoliaEndpoint(rawEndpoint, appID string) (string, error) {
+	endpoint := strings.TrimRight(strings.TrimSpace(rawEndpoint), "/")
+	if endpoint == "" {
+		return "https://" + strings.ToLower(appID) + "-dsn.algolia.net", nil
+	}
+	parsed, err := url.ParseRequestURI(endpoint)
+	if err != nil {
+		return "", fmt.Errorf("invalid algolia endpoint: %w", err)
+	}
+	if parsed.Scheme != "https" && parsed.Scheme != "http" {
+		return "", errors.New("invalid algolia endpoint: scheme must be https or local http")
+	}
+	if parsed.User != nil {
+		return "", errors.New("invalid algolia endpoint: user info is not allowed")
+	}
+	if parsed.RawQuery != "" || parsed.Fragment != "" {
+		return "", errors.New("invalid algolia endpoint: query strings and fragments are not allowed")
+	}
+	if parsed.Path != "" && parsed.Path != "/" {
+		return "", errors.New("invalid algolia endpoint: path must be empty")
+	}
+	host := parsed.Hostname()
+	if host == "" {
+		return "", errors.New("invalid algolia endpoint: host is required")
+	}
+	if isLoopbackHost(host) {
+		return endpoint, nil
+	}
+	if parsed.Scheme != "https" {
+		return "", errors.New("invalid algolia endpoint: remote endpoints must use https")
+	}
+	if !isAlgoliaHost(host) {
+		return "", errors.New("invalid algolia endpoint: host must be an official Algolia endpoint or loopback")
+	}
+	return endpoint, nil
+}
+
+func isLoopbackHost(host string) bool {
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+func isAlgoliaHost(host string) bool {
+	host = strings.ToLower(host)
+	return host == "algolia.net" || strings.HasSuffix(host, ".algolia.net")
 }
 
 func isAlgoliaAppID(appID string) bool {
@@ -140,19 +188,31 @@ type algoliaJSONRequest struct {
 	operation  string
 }
 
+// algoliaPostJSON sends a JSON-bodied POST through the shared transport.
 func algoliaPostJSON(ctx context.Context, algoliaReq algoliaJSONRequest) (*http.Response, error) {
 	payload, err := json.Marshal(algoliaReq.body)
 	if err != nil {
 		return nil, err
 	}
-
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, algoliaReq.endpoint, bytes.NewReader(payload))
 	if err != nil {
 		return nil, fmt.Errorf("building algolia %s request: %w", algoliaReq.operation, err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	setAlgoliaHeaders(req, algoliaReq.appID, algoliaReq.apiKey)
+	return executeAlgoliaRequest(req, algoliaReq)
+}
 
+// algoliaGetJSON sends an authenticated, body-less GET through the shared transport.
+func algoliaGetJSON(ctx context.Context, algoliaReq algoliaJSONRequest) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, algoliaReq.endpoint, nil)
+	if err != nil {
+		return nil, fmt.Errorf("building algolia %s request: %w", algoliaReq.operation, err)
+	}
+	return executeAlgoliaRequest(req, algoliaReq)
+}
+
+func executeAlgoliaRequest(req *http.Request, algoliaReq algoliaJSONRequest) (*http.Response, error) {
+	setAlgoliaHeaders(req, algoliaReq.appID, algoliaReq.apiKey)
 	resp, err := algoliaReq.httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("algolia %s request failed: %w", algoliaReq.operation, err)
